@@ -1,0 +1,7 @@
+{
+  "ml_mean_flat": 0.7955316742081449,
+  "ml_mean_hier": 0.797935520361991,
+  "dl_mean_flat": 0.8209134615384616,
+  "dl_mean_hier": 0.822468891402715,
+  "note": "ML uses weighted SVM fusion; DL uses FC(c2r_tune1) and RCNN weighted+constraint sweep."
+}
