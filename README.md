@@ -39,6 +39,175 @@ pip install -r requirements.txt
 
 如果你使用 CUDA 服务器，建议先确认 `torch` 已安装为对应的 CUDA 版本。
 
+### 3.1 Windows 训练机直接复制版
+
+如果你已经把仓库、数据和本地 BERT 同步到 Windows 机器，并且目录与下面一致，可以直接复制本节命令到 `cmd` 中执行：
+
+- 项目目录：`D:\project\charge-prediction-paper-repro`
+- 本地 BERT：`D:\project\charge-prediction-paper-repro\chinese-bert-wwm-ext`
+- 原始数据：`D:\project\2018数据集\2018数据集`
+- 已验证可用的 conda 环境：`D:\conda_envs\caoyao-resnet`
+
+先进入环境和项目目录：
+
+```bat
+call D:\software\miniconda\condabin\conda.bat activate D:\conda_envs\caoyao-resnet
+cd /d D:\project\charge-prediction-paper-repro
+set BERT_DIR=D:\project\charge-prediction-paper-repro\chinese-bert-wwm-ext
+```
+
+检查 GPU 和 PyTorch：
+
+```bat
+python -c "import torch; print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0))"
+```
+
+最小烟雾测试：确认模型、CUDA、数据集都能跑通。这个命令只跑很少样本和 `1` 个 epoch，适合先验环境。
+
+```bat
+python scripts\train_deep_models.py ^
+  --data-dir data\processed_110_paper ^
+  --output-dir outputs_smoke\deep_models ^
+  --models fc ^
+  --device cuda ^
+  --pretrained-model "%BERT_DIR%" ^
+  --epochs 1 ^
+  --train-batch-size 2 ^
+  --eval-batch-size 2 ^
+  --gradient-accumulation-steps 1 ^
+  --selection-metric accuracy ^
+  --max-train-samples 64 ^
+  --max-valid-samples 32 ^
+  --max-test-samples 32
+```
+
+如果你要先正式跑一个最稳的版本，建议从 `BERT-FC` 开始：
+
+```bat
+python scripts\train_deep_models.py ^
+  --data-dir data\processed_110_paper ^
+  --output-dir outputs_paper\deep_models ^
+  --models fc ^
+  --device cuda ^
+  --pretrained-model "%BERT_DIR%" ^
+  --epochs 4 ^
+  --train-batch-size 2 ^
+  --eval-batch-size 4 ^
+  --gradient-accumulation-steps 4 ^
+  --selection-metric accuracy
+```
+
+如果你要同时跑 `BERT-FC` 和 `BERT-RCNN` 两个平层模型，用下面这条：
+
+```bat
+python scripts\train_deep_models.py ^
+  --data-dir data\processed_110_paper ^
+  --output-dir outputs_paper\deep_models ^
+  --models fc rcnn ^
+  --device cuda ^
+  --pretrained-model "%BERT_DIR%" ^
+  --epochs 4 ^
+  --train-batch-size 2 ^
+  --eval-batch-size 4 ^
+  --gradient-accumulation-steps 4 ^
+  --selection-metric accuracy
+```
+
+跑 `BERT-FC` 的层次模型：
+
+```bat
+python scripts\train_deep_hierarchical.py ^
+  --data-dir data\processed_110_paper ^
+  --output-dir outputs_paper\deep_hierarchical_fc ^
+  --device cuda ^
+  --fine-model-type fc ^
+  --coarse-model-type fc ^
+  --pretrained-model "%BERT_DIR%" ^
+  --epochs 4 ^
+  --train-batch-size 2 ^
+  --eval-batch-size 4 ^
+  --gradient-accumulation-steps 4 ^
+  --fallback-to-flat ^
+  --fine-checkpoint outputs_paper\deep_models\fc\best_fc.pt
+```
+
+跑 `BERT-RCNN` 的层次模型：
+
+```bat
+python scripts\train_deep_hierarchical.py ^
+  --data-dir data\processed_110_paper ^
+  --output-dir outputs_paper\deep_hierarchical_rcnn ^
+  --device cuda ^
+  --fine-model-type rcnn ^
+  --coarse-model-type rcnn ^
+  --pretrained-model "%BERT_DIR%" ^
+  --epochs 4 ^
+  --train-batch-size 1 ^
+  --eval-batch-size 2 ^
+  --gradient-accumulation-steps 8 ^
+  --fallback-to-flat ^
+  --fine-checkpoint outputs_paper\deep_models\rcnn\best_rcnn.pt
+```
+
+如果你想从原始数据开始重建 `110` 类处理数据：
+
+```bat
+python scripts\prepare_data.py ^
+  --data-dir ..\2018数据集\2018数据集 ^
+  --output-dir data\processed_110_paper ^
+  --target-size 50000 ^
+  --seed 42
+```
+
+如果处理后数据已经在 `data\processed_110_paper`，可以直接一键跑完整流程并跳过数据准备：
+
+```bat
+python scripts\run_pipeline.py ^
+  --skip-prepare ^
+  --processed-dir data\processed_110_paper ^
+  --output-dir outputs_paper ^
+  --device cuda ^
+  --pretrained-model "%BERT_DIR%" ^
+  --epochs 4 ^
+  --train-batch-size 2 ^
+  --eval-batch-size 4 ^
+  --gradient-accumulation-steps 4 ^
+  --fallback-to-flat
+```
+
+导出主结果表：
+
+```bat
+python scripts\make_results_table.py ^
+  --output-dir outputs_paper ^
+  --save-path outputs_paper\results_table.csv
+```
+
+单条推理：
+
+```bat
+python scripts\predict.py ^
+  --artifact-path outputs_paper\deep_hierarchical_fc\model_bundle.json ^
+  --device cuda ^
+  --text "被告人张某深夜持刀抢劫路人手机和现金。"
+```
+
+批量推理：
+
+```bat
+python scripts\predict.py ^
+  --artifact-path outputs_paper\deep_hierarchical_fc\model_bundle.json ^
+  --device cuda ^
+  --input-file demo.jsonl ^
+  --output-file outputs_paper\predictions.csv
+```
+
+显存不够时，优先这样调：
+
+- `BERT-FC`: 把 `--train-batch-size` 降到 `1`
+- `BERT-RCNN`: 把 `--train-batch-size` 降到 `1`，`--eval-batch-size` 降到 `2`
+- 如果后台有游戏、浏览器或桌面程序占显存，先关掉再训练
+
 ## 4. 数据准备
 
 仓库不直接包含原始 CAIL 数据。请把原始数据放到与仓库同级的目录：
