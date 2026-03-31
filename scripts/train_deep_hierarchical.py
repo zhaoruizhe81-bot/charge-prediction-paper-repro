@@ -78,6 +78,24 @@ def encode_labels(series: pd.Series, label2id: dict[str, int]) -> np.ndarray:
     return series.map(label2id).fillna(-1).astype(int).to_numpy()
 
 
+def build_fine_to_coarse_mapping(train_df: pd.DataFrame) -> dict[str, str]:
+    mapping_df = (
+        train_df[["fine_label", "coarse_label"]]
+        .drop_duplicates()
+        .drop_duplicates(subset=["fine_label"], keep="first")
+    )
+    return mapping_df.set_index("fine_label")["coarse_label"].to_dict()
+
+
+def normalize_coarse_labels(df: pd.DataFrame, fine_to_coarse: dict[str, str]) -> pd.DataFrame:
+    result = df.copy()
+    # Some processed valid/test rows carry coarse labels that are inconsistent with
+    # the fine label. Normalize them to the train-derived mapping so local
+    # hierarchical models only see labels that belong to their coarse bucket.
+    result["coarse_label"] = result["fine_label"].map(fine_to_coarse).fillna(result["coarse_label"])
+    return result
+
+
 def softmax(x: np.ndarray) -> np.ndarray:
     shifted = x - np.max(x, axis=1, keepdims=True)
     exp = np.exp(shifted)
@@ -152,7 +170,8 @@ def train_subset_model(
         test_labels=test_labels,
         config=config,
     )
-    trainer = DeepChargeTrainer(model_type, len(np.unique(train_labels)), config, device)
+    num_labels = int(np.max(train_labels)) + 1 if train_labels.size else 1
+    trainer = DeepChargeTrainer(model_type, num_labels, config, device)
     best_valid, best_path = trainer.fit(train_loader, valid_loader, output_dir)
     test_metrics = trainer.evaluate(test_loader)
     return trainer, best_valid, test_metrics, best_path
@@ -266,6 +285,11 @@ def main() -> None:
     train_df = load_split(args.data_dir / "train_50k.jsonl")
     valid_df = load_split(args.data_dir / "valid_50k.jsonl")
     test_df = load_split(args.data_dir / "test_50k.jsonl")
+
+    fine_to_coarse = build_fine_to_coarse_mapping(train_df)
+    train_df = normalize_coarse_labels(train_df, fine_to_coarse)
+    valid_df = normalize_coarse_labels(valid_df, fine_to_coarse)
+    test_df = normalize_coarse_labels(test_df, fine_to_coarse)
 
     fine_l2i, fine_i2l = fit_label_encoder(train_df["fine_label"].tolist())
     coarse_l2i, coarse_i2l = fit_label_encoder(train_df["coarse_label"].tolist())
