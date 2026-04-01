@@ -32,11 +32,43 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-batch-size", type=int, default=8)
     parser.add_argument("--eval-batch-size", type=int, default=16)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=2)
+    parser.add_argument(
+        "--optimize-profile",
+        type=str,
+        default="baseline",
+        choices=["baseline", "windows_4060ti_best"],
+    )
+    parser.add_argument("--loss", type=str, default="", choices=["", "ce", "weighted_ce", "focal"])
+    parser.add_argument("--label-smoothing", type=float, default=-1.0)
+    parser.add_argument("--sampler", type=str, default="", choices=["", "none", "weighted"])
+    parser.add_argument("--pin-memory", type=str, default="auto", choices=["auto", "on", "off"])
+    parser.add_argument("--persistent-workers", type=str, default="auto", choices=["auto", "on", "off"])
+    parser.add_argument("--prefetch-factor", type=int, default=0)
     parser.add_argument("--skip-prepare", action="store_true")
     parser.add_argument("--skip-flat", action="store_true")
     parser.add_argument("--skip-hier", action="store_true")
     parser.add_argument("--fallback-to-flat", action="store_true")
     return parser.parse_args()
+
+
+def optimization_args(args: argparse.Namespace) -> list[str]:
+    extra = [
+        "--optimize-profile",
+        args.optimize_profile,
+        "--pin-memory",
+        args.pin_memory,
+        "--persistent-workers",
+        args.persistent_workers,
+    ]
+    if args.loss:
+        extra.extend(["--loss", args.loss])
+    if args.label_smoothing >= 0:
+        extra.extend(["--label-smoothing", str(args.label_smoothing)])
+    if args.sampler:
+        extra.extend(["--sampler", args.sampler])
+    if args.prefetch_factor > 0:
+        extra.extend(["--prefetch-factor", str(args.prefetch_factor)])
+    return extra
 
 
 def main() -> None:
@@ -85,6 +117,7 @@ def main() -> None:
                 str(args.gradient_accumulation_steps),
                 "--seed",
                 str(args.seed),
+                *optimization_args(args),
             ]
         )
 
@@ -118,6 +151,7 @@ def main() -> None:
                 str(args.gradient_accumulation_steps),
                 "--seed",
                 str(args.seed),
+                *optimization_args(args),
             ]
             if args.fallback_to_flat:
                 cmd.append("--fallback-to-flat")

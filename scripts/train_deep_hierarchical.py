@@ -21,10 +21,13 @@ from charge_prediction.deep_models import (
     DeepTrainingConfig,
     build_dataloaders,
     build_predict_dataloader,
+    build_tokenizer_cache_key,
+    compute_class_weights,
+    compute_sample_weights,
     resolve_device,
     set_seed,
 )
-from charge_prediction.metrics import compute_classification_metrics
+from charge_prediction.metrics import build_head_tail_summary, compute_classification_metrics, compute_per_class_metrics
 
 
 def parse_args() -> argparse.Namespace:
@@ -60,6 +63,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fallback-to-flat", action="store_true")
     parser.add_argument("--coarse-threshold", type=float, default=-1.0)
     parser.add_argument("--coarse-margin-threshold", type=float, default=-1.0)
+    parser.add_argument(
+        "--optimize-profile",
+        type=str,
+        default="baseline",
+        choices=["baseline", "windows_4060ti_best"],
+    )
+    parser.add_argument("--loss", type=str, default="", choices=["", "ce", "weighted_ce", "focal"])
+    parser.add_argument("--label-smoothing", type=float, default=-1.0)
+    parser.add_argument("--sampler", type=str, default="", choices=["", "none", "weighted"])
+    parser.add_argument("--pin-memory", type=str, default="auto", choices=["auto", "on", "off"])
+    parser.add_argument("--persistent-workers", type=str, default="auto", choices=["auto", "on", "off"])
+    parser.add_argument("--prefetch-factor", type=int, default=0)
     return parser.parse_args()
 
 
@@ -128,7 +143,36 @@ def is_better(candidate: dict[str, float], best: dict[str, float], metric_name: 
     return float(candidate.get("accuracy", 0.0)) > float(best.get("accuracy", 0.0)) + 1e-12
 
 
-def build_config(args: argparse.Namespace) -> DeepTrainingConfig:
+def resolve_toggle(value: str) -> bool | None:
+    if value == "auto":
+        return None
+    return value == "on"
+
+
+def apply_optimization_profile(args: argparse.Namespace) -> argparse.Namespace:
+    if args.optimize_profile == "windows_4060ti_best":
+        args.loss = "weighted_ce" if not args.loss else args.loss
+        args.label_smoothing = 0.05 if args.label_smoothing < 0 else args.label_smoothing
+        args.sampler = "weighted" if not args.sampler else args.sampler
+        args.selection_metric = "f1_macro"
+        args.early_stopping_patience = 3
+        if args.pin_memory == "auto":
+            args.pin_memory = "on"
+        if args.persistent_workers == "auto":
+            args.persistent_workers = "off"
+        if args.prefetch_factor <= 0:
+            args.prefetch_factor = 2
+
+    if not args.loss:
+        args.loss = "ce"
+    if args.label_smoothing < 0:
+        args.label_smoothing = 0.0
+    if not args.sampler:
+        args.sampler = "none"
+    return args
+
+
+def build_config(args: argparse.Namespace, *, is_coarse: bool) -> DeepTrainingConfig:
     return DeepTrainingConfig(
         pretrained_model_name=args.pretrained_model,
         max_length=args.max_length,
@@ -145,7 +189,15 @@ def build_config(args: argparse.Namespace) -> DeepTrainingConfig:
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         seed=args.seed,
         num_workers=args.num_workers,
-        selection_metric=args.selection_metric,
+        selection_metric="accuracy" if is_coarse else args.selection_metric,
+        optimize_profile=args.optimize_profile,
+        loss_name="ce" if is_coarse else args.loss,
+        label_smoothing=0.0 if is_coarse else args.label_smoothing,
+        sampler_name="none" if is_coarse else args.sampler,
+        pin_memory=resolve_toggle(args.pin_memory),
+        persistent_workers=resolve_toggle(args.persistent_workers),
+        prefetch_factor=args.prefetch_factor if args.prefetch_factor > 0 else None,
+        enable_tokenizer_cache=args.optimize_profile != "baseline",
     )
 
 
@@ -160,7 +212,27 @@ def train_subset_model(
     valid_labels: np.ndarray,
     test_texts: list[str],
     test_labels: np.ndarray,
+    class_weights: np.ndarray | None = None,
+    train_sample_weights: np.ndarray | None = None,
+    train_sampler_name: str | None = None,
+    train_cache_key: str | None = None,
+    valid_cache_key: str | None = None,
+    test_cache_key: str | None = None,
 ) -> tuple[DeepChargeTrainer, dict[str, float], dict[str, float], Path]:
+    train_mask = train_labels >= 0
+    valid_mask = valid_labels >= 0
+    test_mask = test_labels >= 0
+
+    train_texts = [text for text, keep in zip(train_texts, train_mask.tolist()) if keep]
+    valid_texts = [text for text, keep in zip(valid_texts, valid_mask.tolist()) if keep]
+    test_texts = [text for text, keep in zip(test_texts, test_mask.tolist()) if keep]
+
+    train_labels = train_labels[train_mask]
+    valid_labels = valid_labels[valid_mask]
+    test_labels = test_labels[test_mask]
+    if train_sample_weights is not None:
+        train_sample_weights = train_sample_weights[train_mask]
+
     train_loader, valid_loader, test_loader, _ = build_dataloaders(
         train_texts=train_texts,
         train_labels=train_labels,
@@ -169,9 +241,14 @@ def train_subset_model(
         test_texts=test_texts,
         test_labels=test_labels,
         config=config,
+        train_cache_key=train_cache_key,
+        valid_cache_key=valid_cache_key,
+        test_cache_key=test_cache_key,
+        train_sample_weights=train_sample_weights,
+        train_sampler_name=train_sampler_name,
     )
     num_labels = int(np.max(train_labels)) + 1 if train_labels.size else 1
-    trainer = DeepChargeTrainer(model_type, num_labels, config, device)
+    trainer = DeepChargeTrainer(model_type, num_labels, config, device, class_weights=class_weights)
     best_valid, best_path = trainer.fit(train_loader, valid_loader, output_dir)
     test_metrics = trainer.evaluate(test_loader)
     return trainer, best_valid, test_metrics, best_path
@@ -275,16 +352,59 @@ def tune_routing(
     return best_config, best_pred, best_metrics, best_stats
 
 
+def export_hierarchical_diagnostics(
+    output_dir: Path,
+    *,
+    id2label: dict[int, str],
+    train_labels: np.ndarray,
+    y_true: np.ndarray,
+    variants: dict[str, np.ndarray],
+) -> None:
+    label_ids = sorted(id2label.keys())
+    train_support = {int(label_id): int(count) for label_id, count in enumerate(np.bincount(train_labels, minlength=len(label_ids)))}
+
+    all_rows: list[dict[str, object]] = []
+    head_tail_summary: dict[str, object] = {}
+    for variant_name, y_pred in variants.items():
+        rows = compute_per_class_metrics(
+            y_true,
+            y_pred,
+            label_ids=label_ids,
+            id2label=id2label,
+            train_support=train_support,
+        )
+        for row in rows:
+            row["variant"] = variant_name
+        all_rows.extend(rows)
+        head_tail_summary[variant_name] = build_head_tail_summary(rows)
+
+    pd.DataFrame(all_rows).to_csv(output_dir / "per_class_metrics.csv", index=False, encoding="utf-8-sig")
+    (output_dir / "head_tail_metrics.json").write_text(
+        json.dumps(head_tail_summary, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def build_routing_note(routing_config: dict[str, object]) -> str:
+    if not bool(routing_config.get("use_hierarchical_routing", False)):
+        return "Hierarchical training completed, but validation tuning kept the flat baseline as the final routing strategy."
+    return "Hierarchical routing was enabled by validation tuning."
+
+
 def main() -> None:
-    args = parse_args()
+    args = apply_optimization_profile(parse_args())
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     set_seed(args.seed)
     device = resolve_device(args.device)
 
-    train_df = load_split(args.data_dir / "train_50k.jsonl")
-    valid_df = load_split(args.data_dir / "valid_50k.jsonl")
-    test_df = load_split(args.data_dir / "test_50k.jsonl")
+    train_path = args.data_dir / "train_50k.jsonl"
+    valid_path = args.data_dir / "valid_50k.jsonl"
+    test_path = args.data_dir / "test_50k.jsonl"
+
+    train_df = load_split(train_path)
+    valid_df = load_split(valid_path)
+    test_df = load_split(test_path)
 
     fine_to_coarse = build_fine_to_coarse_mapping(train_df)
     train_df = normalize_coarse_labels(train_df, fine_to_coarse)
@@ -305,7 +425,42 @@ def main() -> None:
     y_valid_c = encode_labels(valid_df["coarse_label"], coarse_l2i)
     y_test_c = encode_labels(test_df["coarse_label"], coarse_l2i)
 
-    config = build_config(args)
+    fine_config = build_config(args, is_coarse=False)
+    coarse_config = build_config(args, is_coarse=True)
+
+    fine_class_weights = compute_class_weights(y_train_f, num_labels=len(fine_l2i))
+    fine_sample_weights = compute_sample_weights(y_train_f, fine_class_weights) if args.sampler == "weighted" else None
+
+    fine_train_cache_key = build_tokenizer_cache_key(
+        train_path,
+        fine_config,
+        extra=f"hier-fine-train|seed={args.seed}",
+    )
+    fine_valid_cache_key = build_tokenizer_cache_key(
+        valid_path,
+        fine_config,
+        extra="hier-fine-valid",
+    )
+    fine_test_cache_key = build_tokenizer_cache_key(
+        test_path,
+        fine_config,
+        extra="hier-fine-test",
+    )
+    coarse_train_cache_key = build_tokenizer_cache_key(
+        train_path,
+        coarse_config,
+        extra=f"hier-coarse-train|seed={args.seed}",
+    )
+    coarse_valid_cache_key = build_tokenizer_cache_key(
+        valid_path,
+        coarse_config,
+        extra="hier-coarse-valid",
+    )
+    coarse_test_cache_key = build_tokenizer_cache_key(
+        test_path,
+        coarse_config,
+        extra="hier-coarse-test",
+    )
 
     fine_train_loader, fine_valid_loader, fine_test_loader, _ = build_dataloaders(
         train_texts=x_train,
@@ -314,7 +469,12 @@ def main() -> None:
         valid_labels=y_valid_f,
         test_texts=x_test,
         test_labels=y_test_f,
-        config=config,
+        config=fine_config,
+        train_cache_key=fine_train_cache_key,
+        valid_cache_key=fine_valid_cache_key,
+        test_cache_key=fine_test_cache_key,
+        train_sample_weights=fine_sample_weights,
+        train_sampler_name=args.sampler,
     )
     coarse_train_loader, coarse_valid_loader, coarse_test_loader, _ = build_dataloaders(
         train_texts=x_train,
@@ -323,11 +483,21 @@ def main() -> None:
         valid_labels=y_valid_c,
         test_texts=x_test,
         test_labels=y_test_c,
-        config=config,
+        config=coarse_config,
+        train_cache_key=coarse_train_cache_key,
+        valid_cache_key=coarse_valid_cache_key,
+        test_cache_key=coarse_test_cache_key,
+        train_sampler_name="none",
     )
 
     flat_output_dir = args.output_dir / "flat_model"
-    flat_trainer = DeepChargeTrainer(args.fine_model_type, len(fine_l2i), config, device)
+    flat_trainer = DeepChargeTrainer(
+        args.fine_model_type,
+        len(fine_l2i),
+        fine_config,
+        device,
+        class_weights=fine_class_weights if args.loss in {"weighted_ce", "focal"} else None,
+    )
     import torch
 
     fine_ckpt_path = Path(args.fine_checkpoint).expanduser() if args.fine_checkpoint else None
@@ -340,7 +510,7 @@ def main() -> None:
     flat_test_metrics = flat_trainer.evaluate(fine_test_loader)
 
     coarse_output_dir = args.output_dir / "coarse_model"
-    coarse_trainer = DeepChargeTrainer(args.coarse_model_type, len(coarse_l2i), config, device)
+    coarse_trainer = DeepChargeTrainer(args.coarse_model_type, len(coarse_l2i), coarse_config, device)
     coarse_best_valid, coarse_best_path = coarse_trainer.fit(coarse_train_loader, coarse_valid_loader, coarse_output_dir)
     coarse_test_metrics = coarse_trainer.evaluate(coarse_test_loader)
 
@@ -353,18 +523,29 @@ def main() -> None:
         local_fine_labels = sorted(train_subset["fine_label"].unique().tolist())
         local_l2i = {label: idx for idx, label in enumerate(local_fine_labels)}
         local_i2g = {idx: fine_l2i[label] for label, idx in local_l2i.items()}
+        local_train_labels = encode_labels(train_subset["fine_label"], local_l2i)
+        local_valid_labels = encode_labels(valid_subset["fine_label"], local_l2i)
+        local_test_labels = encode_labels(test_subset["fine_label"], local_l2i)
+        local_class_weights = compute_class_weights(local_train_labels, num_labels=len(local_l2i))
+        local_sample_weights = compute_sample_weights(local_train_labels, local_class_weights) if args.sampler == "weighted" else None
 
         trainer, best_valid, test_metrics, best_path = train_subset_model(
             output_dir=args.output_dir / "local_models" / coarse_label,
             model_type=args.fine_model_type,
-            config=config,
+            config=fine_config,
             device=device,
             train_texts=train_subset["fact"].tolist(),
-            train_labels=encode_labels(train_subset["fine_label"], local_l2i),
+            train_labels=local_train_labels,
             valid_texts=valid_subset["fact"].tolist(),
-            valid_labels=encode_labels(valid_subset["fine_label"], local_l2i),
+            valid_labels=local_valid_labels,
             test_texts=test_subset["fact"].tolist(),
-            test_labels=encode_labels(test_subset["fine_label"], local_l2i),
+            test_labels=local_test_labels,
+            class_weights=local_class_weights if args.loss in {"weighted_ce", "focal"} else None,
+            train_sample_weights=local_sample_weights,
+            train_sampler_name=args.sampler,
+            train_cache_key=build_tokenizer_cache_key(train_path, fine_config, extra=f"local-train|{coarse_label}|{len(train_subset)}"),
+            valid_cache_key=build_tokenizer_cache_key(valid_path, fine_config, extra=f"local-valid|{coarse_label}|{len(valid_subset)}"),
+            test_cache_key=build_tokenizer_cache_key(test_path, fine_config, extra=f"local-test|{coarse_label}|{len(test_subset)}"),
         )
         local_models[int(coarse_id)] = {
             "coarse_label": coarse_label,
@@ -374,6 +555,9 @@ def main() -> None:
             "checkpoint": str(best_path),
             "local_label2id": local_l2i,
             "local_id2global_fine_id": local_i2g,
+            "num_train": int(len(train_subset)),
+            "num_valid": int(len(valid_subset)),
+            "num_test": int(len(test_subset)),
         }
 
     valid_flat_logits = flat_trainer.collect_logits(fine_valid_loader)
@@ -391,14 +575,14 @@ def main() -> None:
         coarse_logits=valid_coarse_logits,
         flat_pred=valid_flat_pred,
         local_models=local_models,
-        config=config,
+        config=fine_config,
     )
     test_routed_pred = routed_predictions(
         texts=x_test,
         coarse_logits=test_coarse_logits,
         flat_pred=test_flat_pred,
         local_models=local_models,
-        config=config,
+        config=fine_config,
     )
 
     routing_config, valid_hier_pred, valid_hier_metrics, valid_routing_stats = tune_routing(
@@ -406,7 +590,7 @@ def main() -> None:
         flat_pred=valid_flat_pred,
         routed_pred=valid_routed_pred,
         coarse_logits=valid_coarse_logits,
-        metric_name=args.selection_metric,
+        metric_name=fine_config.selection_metric,
         fallback_to_flat=args.fallback_to_flat,
         preset_confidence_threshold=args.coarse_threshold,
         preset_margin_threshold=args.coarse_margin_threshold,
@@ -427,6 +611,7 @@ def main() -> None:
     valid_flat_metrics = compute_classification_metrics(y_valid_f, valid_flat_pred)
     test_flat_metrics = compute_classification_metrics(y_test_f, test_flat_pred)
     test_hier_metrics = compute_classification_metrics(y_test_f, test_hier_pred)
+    routing_note = build_routing_note(routing_config)
 
     intermediate_rows = [
         {
@@ -453,12 +638,19 @@ def main() -> None:
             "coarse_model_type": args.coarse_model_type,
             "pretrained_model": args.pretrained_model,
             "device": str(device),
-            "selection_metric": args.selection_metric,
+            "selection_metric": fine_config.selection_metric,
             "max_length": args.max_length,
             "train_batch_size": args.train_batch_size,
             "eval_batch_size": args.eval_batch_size,
             "gradient_accumulation_steps": args.gradient_accumulation_steps,
             "seed": args.seed,
+            "optimize_profile": args.optimize_profile,
+            "loss": args.loss,
+            "label_smoothing": args.label_smoothing,
+            "sampler": args.sampler,
+            "pin_memory": args.pin_memory,
+            "persistent_workers": args.persistent_workers,
+            "prefetch_factor": args.prefetch_factor,
         },
         "valid": {
             "coarse": compute_classification_metrics(y_valid_c, valid_coarse_pred),
@@ -471,6 +663,7 @@ def main() -> None:
             "fine_hier": test_hier_metrics,
         },
         "routing_config": routing_config,
+        "routing_note": routing_note,
         "routing_stats": {
             "valid": valid_routing_stats,
             "test": test_routing_stats,
@@ -523,9 +716,45 @@ def main() -> None:
     )
     (args.output_dir / "fine_label2id.json").write_text(json.dumps(fine_l2i, ensure_ascii=False, indent=2), encoding="utf-8")
     (args.output_dir / "coarse_label2id.json").write_text(json.dumps(coarse_l2i, ensure_ascii=False, indent=2), encoding="utf-8")
+    export_hierarchical_diagnostics(
+        args.output_dir,
+        id2label=fine_i2l,
+        train_labels=y_train_f,
+        y_true=y_test_f,
+        variants={
+            "fine_flat": test_flat_pred,
+            "fine_hier": test_hier_pred,
+        },
+    )
+    routing_diagnostics = {
+        "routing_config": routing_config,
+        "routing_note": routing_note,
+        "routing_stats": {
+            "valid": valid_routing_stats,
+            "test": test_routing_stats,
+        },
+        "local_models": {
+            str(coarse_id): {
+                "coarse_label": model_info["coarse_label"],
+                "num_local_labels": len(model_info["local_label2id"]),
+                "num_train": model_info["num_train"],
+                "num_valid": model_info["num_valid"],
+                "num_test": model_info["num_test"],
+                "best_valid": model_info["best_valid"],
+                "test_metrics": model_info["test_metrics"],
+                "checkpoint": model_info["checkpoint"],
+            }
+            for coarse_id, model_info in local_models.items()
+        },
+    }
+    (args.output_dir / "routing_diagnostics.json").write_text(
+        json.dumps(routing_diagnostics, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
     print("[Done] deep hierarchical finished")
     print("[Routing config]", routing_config)
+    print("[Routing note  ]", routing_note)
     print("[Test coarse   ]", metrics["test"]["coarse"])
     print("[Test fine-flat]", metrics["test"]["fine_flat"])
     print("[Test fine-hier]", metrics["test"]["fine_hier"])

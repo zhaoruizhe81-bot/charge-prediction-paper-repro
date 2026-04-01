@@ -208,6 +208,70 @@ python scripts\predict.py ^
 - `BERT-RCNN`: 把 `--train-batch-size` 降到 `1`，`--eval-batch-size` 降到 `2`
 - 如果后台有游戏、浏览器或桌面程序占显存，先关掉再训练
 
+### 3.2 Windows 4060 Ti 优化版推荐入口
+
+如果你要在 `RTX 4060 Ti 8GB` 上优先追求更高的 `macro F1`，推荐直接使用仓库根目录下的 `.cmd` 脚本，而不是手动拼接长命令。
+
+先做平层 `fc` 的环境与小样本烟雾测试：
+
+```bat
+run_smoke_flat_fc.cmd
+```
+
+平层 `fc` 优化训练：
+
+```bat
+run_train_flat_fc_optimized.cmd
+```
+
+平层 `rcnn` 优化训练：
+
+```bat
+run_train_flat_rcnn_optimized.cmd
+```
+
+层次 `fc` 训练前的检查：
+
+```bat
+run_smoke_hier_fc.cmd
+```
+
+层次 `fc` 优化训练：
+
+```bat
+run_train_hier_fc_optimized.cmd
+```
+
+层次 `rcnn` 优化训练：
+
+```bat
+run_train_hier_rcnn_optimized.cmd
+```
+
+优化版脚本默认启用的核心策略：
+
+- `optimize_profile = windows_4060ti_best`
+- `loss = weighted_ce`
+- `sampler = weighted`
+- `label_smoothing = 0.05`
+- `selection_metric = f1_macro`
+- tokenizer cache 写入 `.cache/tokenized/`
+
+优化版训练结束后，除了原有 `metrics.json` / `model_bundle.json` 外，还会额外产出：
+
+- `per_class_metrics.csv`: 每个罪名类别的 precision / recall / F1
+- `head_tail_metrics.json`: 头部/中部/尾部类别表现汇总
+- `routing_diagnostics.json`: 层次模型的路由诊断结果
+
+4060 Ti 8GB 的推荐顺序：
+
+1. `run_train_flat_fc_optimized.cmd`
+2. `run_train_hier_fc_optimized.cmd`
+3. `run_train_flat_rcnn_optimized.cmd`
+4. `run_train_hier_rcnn_optimized.cmd`
+
+如果你只想要当前最稳的主模型，优先做完前两步即可。
+
 ## 4. 数据准备
 
 仓库不直接包含原始 CAIL 数据。请把原始数据放到与仓库同级的目录：

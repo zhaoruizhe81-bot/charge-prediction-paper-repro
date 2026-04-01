@@ -8,11 +8,13 @@ __pycache__/
 .ipynb_checkpoints/
 .venv/
 venv/
+.cache/
 
 data/
 outputs/
 outputs_110/
 outputs_paper/
+outputs_smoke/
 outputs_cmp_110_seed66/
 
 *.pt
