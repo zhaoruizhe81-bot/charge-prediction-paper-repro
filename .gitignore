@@ -16,6 +16,7 @@ outputs_110/
 outputs_paper/
 outputs_smoke/
 outputs_cmp_110_seed66/
+chinese-bert-wwm-ext/
 
 *.pt
 *.bin
