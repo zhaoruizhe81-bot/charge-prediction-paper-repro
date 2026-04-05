@@ -14,7 +14,7 @@
   - `侵犯财产罪`
   - `侵犯公民人身权利、民主权利罪`
   - `危害公共安全罪`
-- 细类固定为 `110` 个
+- 细类默认按 `top_k_labels=110` 选择；如果开启稳定重切分且原始支持度不足，实际保留标签数可能少于 `110`
 - 默认抽样 `50000` 条，输出训练/验证/测试集和分析 CSV
 
 ## 2. 目录说明
@@ -288,6 +288,20 @@ run_train_hier_rcnn_optimized.cmd
 python scripts/prepare_data.py \
   --data-dir ../2018数据集/2018数据集 \
   --output-dir data/processed_110_paper \
+  --target-size 50000 \
+  --seed 42
+```
+
+默认会使用更稳的 `rebuild_stable` 策略：先在三大类内筛标签，再从全量样本池重建分层切分，避免验证集/测试集缺失大量标签。默认 `--min-label-support 3`，因此如果支持度不足，最终标签数可能少于 `110`。
+
+如果你想保留旧版“按官方原始 split 过滤”的行为，可以显式指定：
+
+```bash
+python scripts/prepare_data.py \
+  --data-dir ../2018数据集/2018数据集 \
+  --output-dir data/processed_110_paper \
+  --split-strategy official_filtered \
+  --min-label-support 1 \
   --target-size 50000 \
   --seed 42
 ```

@@ -283,6 +283,114 @@ def build_single_label_paper_dataset(
     return train_df, valid_df, test_df, accusation_to_category, top_labels
 
 
+def select_top_fine_labels(
+    dataframe: pd.DataFrame,
+    *,
+    top_k_labels: int = 110,
+    min_label_support: int = 1,
+) -> tuple[list[str], pd.Series]:
+    if top_k_labels <= 0:
+        raise ValueError("top_k_labels must be positive.")
+    if min_label_support <= 0:
+        raise ValueError("min_label_support must be positive.")
+
+    counts = dataframe["fine_label"].value_counts()
+    eligible_counts = counts[counts >= min_label_support]
+    top_labels = eligible_counts.head(top_k_labels).index.tolist()
+    return top_labels, eligible_counts
+
+
+def build_accusation_to_category_from_df(dataframe: pd.DataFrame) -> dict[str, str]:
+    if dataframe.empty:
+        return {}
+    return (
+        dataframe[["fine_label", "coarse_label"]]
+        .drop_duplicates()
+        .set_index("fine_label")["coarse_label"]
+        .to_dict()
+    )
+
+
+def _normalize_split_ratios(train_ratio: float, valid_ratio: float, test_ratio: float) -> tuple[float, float, float]:
+    total = float(train_ratio + valid_ratio + test_ratio)
+    if total <= 0:
+        raise ValueError("Split ratios must sum to a positive value.")
+    return train_ratio / total, valid_ratio / total, test_ratio / total
+
+
+def _allocate_group_split_counts(
+    group_size: int,
+    ratios: tuple[float, float, float],
+    *,
+    min_count_per_split: int = 1,
+) -> tuple[int, int, int]:
+    if group_size < min_count_per_split * 3:
+        raise ValueError(
+            f"Group size {group_size} is too small for 3-way split with min_count_per_split={min_count_per_split}."
+        )
+
+    train_ratio, valid_ratio, test_ratio = ratios
+    counts = [min_count_per_split, min_count_per_split, min_count_per_split]
+    remaining = group_size - sum(counts)
+    if remaining <= 0:
+        return counts[0], counts[1], counts[2]
+
+    ideal = [
+        train_ratio * remaining,
+        valid_ratio * remaining,
+        test_ratio * remaining,
+    ]
+    floors = [int(value) for value in ideal]
+    counts = [base + floor for base, floor in zip(counts, floors)]
+
+    leftover = remaining - sum(floors)
+    order = sorted(
+        range(3),
+        key=lambda index: (ideal[index] - floors[index], ratios[index]),
+        reverse=True,
+    )
+    for index in order[:leftover]:
+        counts[index] += 1
+
+    return counts[0], counts[1], counts[2]
+
+
+def rebuild_stratified_splits(
+    dataframe: pd.DataFrame,
+    *,
+    train_ratio: float,
+    valid_ratio: float,
+    test_ratio: float,
+    label_col: str = "fine_label",
+    seed: int = DEFAULT_RANDOM_SEED,
+    min_count_per_split: int = 1,
+) -> DatasetBundle:
+    ratios = _normalize_split_ratios(train_ratio, valid_ratio, test_ratio)
+
+    train_parts: list[pd.DataFrame] = []
+    valid_parts: list[pd.DataFrame] = []
+    test_parts: list[pd.DataFrame] = []
+
+    label_counts = dataframe[label_col].value_counts()
+    ordered_labels = label_counts.index.tolist()
+    for index, label in enumerate(ordered_labels):
+        group = dataframe[dataframe[label_col] == label].sample(frac=1.0, random_state=seed + index)
+        train_count, valid_count, test_count = _allocate_group_split_counts(
+            len(group),
+            ratios,
+            min_count_per_split=min_count_per_split,
+        )
+
+        train_parts.append(group.iloc[:train_count])
+        valid_parts.append(group.iloc[train_count : train_count + valid_count])
+        test_parts.append(group.iloc[train_count + valid_count : train_count + valid_count + test_count])
+
+    train_df = pd.concat(train_parts, axis=0).sample(frac=1.0, random_state=seed).reset_index(drop=True)
+    valid_df = pd.concat(valid_parts, axis=0).sample(frac=1.0, random_state=seed).reset_index(drop=True)
+    test_df = pd.concat(test_parts, axis=0).sample(frac=1.0, random_state=seed).reset_index(drop=True)
+    return DatasetBundle(train=train_df, valid=valid_df, test=test_df)
+
+
 def apply_hierarchy_labels(
     dataframe: pd.DataFrame,
     accusation_to_category: dict[str, str],
