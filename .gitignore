@@ -1,24 +1,68 @@
+# macOS / Windows cruft
 .DS_Store
+Thumbs.db
+Desktop.ini
+__MACOSX/
+
+# Python bytecode and tooling caches
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
 .pytest_cache/
 .mypy_cache/
+.ruff_cache/
 .ipynb_checkpoints/
+.cache/
+.coverage
+htmlcov/
+
+# Virtual environments and packaging artifacts
 .venv/
 venv/
-.cache/
+env/
+.python-version
+pip-wheel-metadata/
+*.egg-info/
 
+# IDE settings
+.idea/
+.vscode/
+
+# Local env files
+.env
+.env.*
+*.local
+
+# Project data and generated outputs
 data/
 outputs/
 outputs_110/
 outputs_paper/
 outputs_smoke/
 outputs_cmp_110_seed66/
+checkpoints/
+lightning_logs/
+runs/
+wandb/
+tensorboard/
 chinese-bert-wwm-ext/
 
+# Model / training artifacts
 *.pt
+*.pth
+*.ckpt
+*.onnx
 *.bin
 *.joblib
+*.pkl
+*.pickle
+*.sqlite
+*.sqlite3
+*.db
+
+# Logs and temp files
 *.log
+*.tmp
+*.bak
+*.orig
+*.swp
+*.swo
