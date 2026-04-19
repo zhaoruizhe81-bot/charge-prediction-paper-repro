@@ -39,9 +39,16 @@ def compute_classification_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> di
     if y_true.shape[0] == 0:
         return {
             "accuracy": 0.0,
+            "precision_macro": 0.0,
+            "precision_micro": 0.0,
+            "precision_weighted": 0.0,
+            "recall_macro": 0.0,
+            "recall_micro": 0.0,
+            "recall_weighted": 0.0,
             "f1_macro": 0.0,
             "f1_micro": 0.0,
             "f1_weighted": 0.0,
+            "f1_score": 0.0,
         }
 
     if y_true.shape != y_pred.shape:
@@ -50,12 +57,18 @@ def compute_classification_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> di
     accuracy = float(np.mean(y_true == y_pred))
     labels = np.unique(np.concatenate([y_true, y_pred]))
     tp, fp, fn = _per_class_stats(y_true, y_pred, labels)
+    precision_per_class = np.divide(tp, tp + fp, out=np.zeros_like(tp), where=(tp + fp) > 0)
+    recall_per_class = np.divide(tp, tp + fn, out=np.zeros_like(tp), where=(tp + fn) > 0)
     f1_per_class = _f1_from_stats(tp, fp, fn)
 
     support = np.array([(y_true == label).sum() for label in labels], dtype=np.float64)
     total_support = float(np.sum(support))
 
+    macro_precision = float(np.mean(precision_per_class)) if precision_per_class.size else 0.0
+    macro_recall = float(np.mean(recall_per_class)) if recall_per_class.size else 0.0
     macro_f1 = float(np.mean(f1_per_class)) if f1_per_class.size else 0.0
+    weighted_precision = float(np.sum(precision_per_class * support) / total_support) if total_support > 0 else 0.0
+    weighted_recall = float(np.sum(recall_per_class * support) / total_support) if total_support > 0 else 0.0
     weighted_f1 = float(np.sum(f1_per_class * support) / total_support) if total_support > 0 else 0.0
 
     tp_total = float(np.sum(tp))
@@ -67,10 +80,145 @@ def compute_classification_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> di
 
     return {
         "accuracy": accuracy,
+        "precision_macro": macro_precision,
+        "precision_micro": precision_micro,
+        "precision_weighted": weighted_precision,
+        "recall_macro": macro_recall,
+        "recall_micro": recall_micro,
+        "recall_weighted": weighted_recall,
         "f1_macro": macro_f1,
         "f1_micro": micro_f1,
         "f1_weighted": weighted_f1,
+        "f1_score": float((macro_f1 + micro_f1) / 2.0),
     }
+
+
+def compute_multilabel_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
+    """Compute paper-style metrics for binary multi-label targets."""
+    y_true = np.asarray(y_true, dtype=int)
+    y_pred = np.asarray(y_pred, dtype=int)
+    if y_true.size == 0:
+        return {
+            "accuracy": 0.0,
+            "precision_macro": 0.0,
+            "precision_micro": 0.0,
+            "precision_weighted": 0.0,
+            "recall_macro": 0.0,
+            "recall_micro": 0.0,
+            "recall_weighted": 0.0,
+            "f1_macro": 0.0,
+            "f1_micro": 0.0,
+            "f1_weighted": 0.0,
+            "f1_score": 0.0,
+        }
+    if y_true.shape != y_pred.shape:
+        raise ValueError("y_true and y_pred must have the same shape.")
+    if y_true.ndim != 2:
+        raise ValueError("multi-label metrics expect a 2D indicator matrix.")
+
+    exact_match = float(np.mean(np.all(y_true == y_pred, axis=1)))
+    tp = np.sum((y_true == 1) & (y_pred == 1), axis=0).astype(np.float64)
+    fp = np.sum((y_true == 0) & (y_pred == 1), axis=0).astype(np.float64)
+    fn = np.sum((y_true == 1) & (y_pred == 0), axis=0).astype(np.float64)
+    support = np.sum(y_true == 1, axis=0).astype(np.float64)
+    total_support = float(np.sum(support))
+
+    precision = np.divide(tp, tp + fp, out=np.zeros_like(tp), where=(tp + fp) > 0)
+    recall = np.divide(tp, tp + fn, out=np.zeros_like(tp), where=(tp + fn) > 0)
+    f1 = np.divide(2 * precision * recall, precision + recall, out=np.zeros_like(tp), where=(precision + recall) > 0)
+
+    tp_total = float(np.sum(tp))
+    fp_total = float(np.sum(fp))
+    fn_total = float(np.sum(fn))
+    precision_micro = _safe_div(tp_total, tp_total + fp_total)
+    recall_micro = _safe_div(tp_total, tp_total + fn_total)
+    f1_micro = _safe_div(2 * precision_micro * recall_micro, precision_micro + recall_micro)
+
+    macro_precision = float(np.mean(precision)) if precision.size else 0.0
+    macro_recall = float(np.mean(recall)) if recall.size else 0.0
+    macro_f1 = float(np.mean(f1)) if f1.size else 0.0
+    weighted_precision = float(np.sum(precision * support) / total_support) if total_support > 0 else 0.0
+    weighted_recall = float(np.sum(recall * support) / total_support) if total_support > 0 else 0.0
+    weighted_f1 = float(np.sum(f1 * support) / total_support) if total_support > 0 else 0.0
+
+    return {
+        "accuracy": exact_match,
+        "precision_macro": macro_precision,
+        "precision_micro": precision_micro,
+        "precision_weighted": weighted_precision,
+        "recall_macro": macro_recall,
+        "recall_micro": recall_micro,
+        "recall_weighted": weighted_recall,
+        "f1_macro": macro_f1,
+        "f1_micro": f1_micro,
+        "f1_weighted": weighted_f1,
+        "f1_score": float((macro_f1 + f1_micro) / 2.0),
+    }
+
+
+def compute_multilabel_per_label_metrics(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    *,
+    id2label: dict[int, str] | None = None,
+) -> list[dict[str, Any]]:
+    y_true = np.asarray(y_true, dtype=int)
+    y_pred = np.asarray(y_pred, dtype=int)
+    if y_true.shape != y_pred.shape:
+        raise ValueError("y_true and y_pred must have the same shape.")
+
+    rows: list[dict[str, Any]] = []
+    for label_id in range(y_true.shape[1]):
+        true_col = y_true[:, label_id]
+        pred_col = y_pred[:, label_id]
+        tp = float(np.sum((true_col == 1) & (pred_col == 1)))
+        fp = float(np.sum((true_col == 0) & (pred_col == 1)))
+        fn = float(np.sum((true_col == 1) & (pred_col == 0)))
+        support = int(np.sum(true_col == 1))
+        pred_support = int(np.sum(pred_col == 1))
+        precision = _safe_div(tp, tp + fp)
+        recall = _safe_div(tp, tp + fn)
+        f1 = _safe_div(2 * precision * recall, precision + recall)
+        rows.append(
+            {
+                "label_id": int(label_id),
+                "label": (id2label or {}).get(int(label_id), str(label_id)),
+                "support": support,
+                "pred_support": pred_support,
+                "precision": precision,
+                "recall": recall,
+                "f1": f1,
+            }
+        )
+    return rows
+
+
+def multilabel_predictions_from_scores(scores: np.ndarray, threshold: float | np.ndarray) -> np.ndarray:
+    scores = np.asarray(scores, dtype=float)
+    pred = (scores >= threshold).astype(int)
+    if pred.ndim == 2 and pred.shape[0] > 0:
+        empty_rows = np.where(pred.sum(axis=1) == 0)[0]
+        if empty_rows.size:
+            pred[empty_rows, np.argmax(scores[empty_rows], axis=1)] = 1
+    return pred
+
+
+def tune_multilabel_threshold(
+    y_true: np.ndarray,
+    scores: np.ndarray,
+    *,
+    metric_name: str = "f1_score",
+    thresholds: list[float] | None = None,
+) -> tuple[float, dict[str, float]]:
+    candidates = thresholds or [0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6]
+    best_threshold = float(candidates[0])
+    best_metrics = compute_multilabel_metrics(y_true, multilabel_predictions_from_scores(scores, best_threshold))
+    for threshold in candidates[1:]:
+        metrics = compute_multilabel_metrics(y_true, multilabel_predictions_from_scores(scores, float(threshold)))
+        if float(metrics.get(metric_name, 0.0)) > float(best_metrics.get(metric_name, 0.0)):
+            best_threshold = float(threshold)
+            best_metrics = metrics
+    return best_threshold, best_metrics
 
 
 def compute_per_class_metrics(

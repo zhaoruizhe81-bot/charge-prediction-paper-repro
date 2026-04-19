@@ -12,4 +12,11 @@ def compute_classification_metrics(*args: Any, **kwargs: Any) -> dict[str, float
     return _impl(*args, **kwargs)
 
 
-__all__ = ["compute_classification_metrics"]
+def compute_multilabel_metrics(*args: Any, **kwargs: Any) -> dict[str, float]:
+    """Lazy import for law-article multi-label evaluation."""
+    from .metrics import compute_multilabel_metrics as _impl
+
+    return _impl(*args, **kwargs)
+
+
+__all__ = ["compute_classification_metrics", "compute_multilabel_metrics"]

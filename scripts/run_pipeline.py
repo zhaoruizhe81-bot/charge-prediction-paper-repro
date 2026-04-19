@@ -21,8 +21,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the paper-style charge prediction pipeline")
     parser.add_argument("--data-dir", type=Path, default=Path("../2018数据集/2018数据集"))
     parser.add_argument("--processed-dir", type=Path, default=Path("data/processed_110_paper"))
+    parser.add_argument("--law-processed-dir", type=Path, default=Path("data/processed_law"))
     parser.add_argument("--output-dir", type=Path, default=Path("outputs_paper"))
     parser.add_argument("--target-size", type=int, default=50000)
+    parser.add_argument("--law-target-size", type=int, default=0)
+    parser.add_argument("--law-top-k-articles", type=int, default=183)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "mps", "cpu"])
     parser.add_argument("--pretrained-model", type=str, default="hfl/chinese-bert-wwm-ext")
@@ -47,6 +50,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-prepare", action="store_true")
     parser.add_argument("--skip-flat", action="store_true")
     parser.add_argument("--skip-hier", action="store_true")
+    parser.add_argument("--include-law", action="store_true")
+    parser.add_argument("--skip-law-prepare", action="store_true")
+    parser.add_argument("--skip-law-deep", action="store_true")
+    parser.add_argument("--skip-law-hier", action="store_true")
+    parser.add_argument("--skip-final-report", action="store_true")
     parser.add_argument("--fallback-to-flat", action="store_true")
     return parser.parse_args()
 
@@ -159,6 +167,71 @@ def main() -> None:
                 cmd.extend(["--fine-checkpoint", str(fine_ckpt)])
             run(cmd)
 
+    if args.include_law:
+        if not args.skip_law_prepare:
+            run(
+                [
+                    sys.executable,
+                    str(ROOT_DIR / "scripts" / "prepare_law_data.py"),
+                    "--data-dir",
+                    str(args.data_dir),
+                    "--output-dir",
+                    str(args.law_processed_dir),
+                    "--target-size",
+                    str(args.law_target_size),
+                    "--top-k-articles",
+                    str(args.law_top_k_articles),
+                    "--seed",
+                    str(args.seed),
+                ]
+            )
+
+        if not args.skip_law_deep:
+            run(
+                [
+                    sys.executable,
+                    str(ROOT_DIR / "scripts" / "train_law_deep_models.py"),
+                    "--data-dir",
+                    str(args.law_processed_dir),
+                    "--output-dir",
+                    str(args.output_dir / "law_deep"),
+                    "--models",
+                    *args.deep_models,
+                    "--device",
+                    args.device,
+                    "--pretrained-model",
+                    args.pretrained_model,
+                    "--epochs",
+                    str(args.epochs),
+                    "--max-length",
+                    str(args.max_length),
+                    "--train-batch-size",
+                    str(args.train_batch_size),
+                    "--eval-batch-size",
+                    str(args.eval_batch_size),
+                    "--gradient-accumulation-steps",
+                    str(args.gradient_accumulation_steps),
+                    "--seed",
+                    str(args.seed),
+                ]
+            )
+
+        if not args.skip_law_hier:
+            run(
+                [
+                    sys.executable,
+                    str(ROOT_DIR / "scripts" / "train_law_hierarchical.py"),
+                    "--law-deep-dir",
+                    str(args.output_dir / "law_deep"),
+                    "--output-dir",
+                    str(args.output_dir / "law_hierarchical"),
+                    "--models",
+                    *args.deep_models,
+                    "--base-model",
+                    args.deep_models[0],
+                ]
+            )
+
     run(
         [
             sys.executable,
@@ -169,6 +242,19 @@ def main() -> None:
             str(args.output_dir / "results_table.csv"),
         ]
     )
+
+    if not args.skip_final_report:
+        run(
+            [
+                sys.executable,
+                str(ROOT_DIR / "scripts" / "show_final_results.py"),
+                "--output-dir",
+                str(args.output_dir),
+                "--export-dir",
+                str(args.output_dir / "final_report"),
+                "--skip-table-refresh",
+            ]
+        )
 
     print("\n[Done] Full paper-style pipeline finished")
 

@@ -368,17 +368,52 @@ python scripts/train_deep_hierarchical.py \
 - 第 2 阶段：按预测粗类进入对应细分类器
 - 门控回退：如果粗类置信度或 margin 不足，则回退到平层预测，避免层次模型拖低基线
 
-## 7. 一键跑全流程
+## 7. 法条推荐与一键跑全流程
+
+先构建 183 类多标签法条数据：
+
+```bash
+python scripts/prepare_law_data.py \
+  --data-dir ../2018数据集/2018数据集 \
+  --output-dir data/processed_law \
+  --top-k-articles 183
+```
+
+训练平层法条推荐模型：
+
+```bash
+python scripts/train_law_deep_models.py \
+  --data-dir data/processed_law \
+  --output-dir outputs_paper/law_deep \
+  --models fc rcnn \
+  --device cuda \
+  --pretrained-model hfl/chinese-bert-wwm-ext \
+  --epochs 4
+```
+
+基于验证集划分易混淆法条并做层次融合：
+
+```bash
+python scripts/train_law_hierarchical.py \
+  --law-deep-dir outputs_paper/law_deep \
+  --output-dir outputs_paper/law_hierarchical \
+  --models fc rcnn \
+  --base-model fc
+```
+
+罪名预测 + 法条推荐完整流程可加 `--include-law`：
 
 ```bash
 python scripts/run_pipeline.py \
   --data-dir ../2018数据集/2018数据集 \
   --processed-dir data/processed_110_paper \
+  --law-processed-dir data/processed_law \
   --output-dir outputs_paper \
   --device cuda \
   --pretrained-model hfl/chinese-bert-wwm-ext \
   --epochs 4 \
-  --fallback-to-flat
+  --fallback-to-flat \
+  --include-law
 ```
 
 ## 8. 结果表导出
@@ -392,7 +427,17 @@ python scripts/make_results_table.py \
 输出包括：
 - `results_table.csv/.md`: 主结果表
 - `results_table_contrast.csv/.md`: 同骨干 `flat vs hier` 增益表
-- `results_table_intermediate.csv/.md`: 层次中间步骤准确率表
+- `results_table_intermediate.csv/.md`: 层次中间步骤指标表
+
+主表指标列为 `accuracy`、`recall_macro`、`recall_micro`、`f1_score`。最终展示和 ROC/AUC 曲线：
+
+```bash
+python scripts/show_final_results.py \
+  --output-dir outputs_paper \
+  --export-dir outputs_paper/final_report
+```
+
+该命令会生成 `final_summary.md`、`requirements_check.md`、`auc_summary.csv` 和 `roc_auc/*.png`。
 
 ## 9. 推理
 

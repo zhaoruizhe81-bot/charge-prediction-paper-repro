@@ -55,7 +55,7 @@ def parse_args() -> argparse.Namespace:
         "--selection-metric",
         type=str,
         default="accuracy",
-        choices=["accuracy", "f1_macro", "f1_micro", "f1_weighted"],
+        choices=["accuracy", "recall_macro", "recall_micro", "recall_weighted", "f1_macro", "f1_micro", "f1_weighted", "f1_score"],
     )
     parser.add_argument("--max-train-samples", type=int, default=0)
     parser.add_argument("--max-valid-samples", type=int, default=0)
@@ -267,8 +267,19 @@ def main() -> None:
             output_dir=model_output_dir,
         )
         test_metrics = trainer.evaluate(test_loader)
+        valid_logits = trainer.collect_logits(valid_loader)
         test_logits = trainer.collect_logits(test_loader)
+        valid_preds = np.argmax(valid_logits, axis=1) if valid_logits.size else np.empty((0,), dtype=int)
         test_preds = np.argmax(test_logits, axis=1) if test_logits.size else np.empty((0,), dtype=int)
+        np.savez_compressed(
+            model_output_dir / "eval_outputs.npz",
+            y_valid=y_valid.astype(np.int64),
+            valid_logits=valid_logits.astype(np.float32),
+            valid_pred=valid_preds.astype(np.int64),
+            y_test=y_test.astype(np.int64),
+            test_logits=test_logits.astype(np.float32),
+            test_pred=test_preds.astype(np.int64),
+        )
         export_diagnostics(
             model_output_dir,
             id2label=id2label,

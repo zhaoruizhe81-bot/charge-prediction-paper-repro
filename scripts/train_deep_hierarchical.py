@@ -54,11 +54,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rcnn-num-layers", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--max-train-samples", type=int, default=0)
+    parser.add_argument("--max-valid-samples", type=int, default=0)
+    parser.add_argument("--max-test-samples", type=int, default=0)
     parser.add_argument(
         "--selection-metric",
         type=str,
         default="accuracy",
-        choices=["accuracy", "f1_macro", "f1_micro", "f1_weighted"],
+        choices=["accuracy", "recall_macro", "recall_micro", "recall_weighted", "f1_macro", "f1_micro", "f1_weighted", "f1_score"],
     )
     parser.add_argument("--fallback-to-flat", action="store_true")
     parser.add_argument("--coarse-threshold", type=float, default=-1.0)
@@ -80,6 +83,12 @@ def parse_args() -> argparse.Namespace:
 
 def load_split(path: Path) -> pd.DataFrame:
     return pd.DataFrame(read_jsonl(path))
+
+
+def limit_df(df: pd.DataFrame, max_samples: int, seed: int) -> pd.DataFrame:
+    if max_samples and len(df) > max_samples:
+        return df.sample(n=max_samples, random_state=seed).reset_index(drop=True)
+    return df
 
 
 def fit_label_encoder(labels: list[str]) -> tuple[dict[str, int], dict[int, str]]:
@@ -411,6 +420,20 @@ def main() -> None:
     valid_df = normalize_coarse_labels(valid_df, fine_to_coarse)
     test_df = normalize_coarse_labels(test_df, fine_to_coarse)
 
+    train_df = limit_df(train_df, args.max_train_samples, args.seed)
+    train_fine_labels = set(train_df["fine_label"].tolist())
+    train_coarse_labels = set(train_df["coarse_label"].tolist())
+    valid_df = valid_df[
+        valid_df["fine_label"].isin(train_fine_labels) & valid_df["coarse_label"].isin(train_coarse_labels)
+    ].reset_index(drop=True)
+    test_df = test_df[
+        test_df["fine_label"].isin(train_fine_labels) & test_df["coarse_label"].isin(train_coarse_labels)
+    ].reset_index(drop=True)
+    valid_df = limit_df(valid_df, args.max_valid_samples, args.seed)
+    test_df = limit_df(test_df, args.max_test_samples, args.seed)
+    if train_df.empty or valid_df.empty or test_df.empty:
+        raise ValueError("Smoke/limited splits must all be non-empty after label filtering.")
+
     fine_l2i, fine_i2l = fit_label_encoder(train_df["fine_label"].tolist())
     coarse_l2i, coarse_i2l = fit_label_encoder(train_df["coarse_label"].tolist())
 
@@ -613,21 +636,27 @@ def main() -> None:
     test_hier_metrics = compute_classification_metrics(y_test_f, test_hier_pred)
     routing_note = build_routing_note(routing_config)
 
+    def intermediate_row(split: str, stage: str, metric_values: dict[str, float]) -> dict[str, object]:
+        return {
+            "split": split,
+            "stage": stage,
+            "accuracy": float(metric_values.get("accuracy", 0.0)),
+            "recall_macro": float(metric_values.get("recall_macro", 0.0)),
+            "recall_micro": float(metric_values.get("recall_micro", 0.0)),
+            "f1_score": float(metric_values.get("f1_score", 0.0)),
+            "f1_macro": float(metric_values.get("f1_macro", 0.0)),
+            "f1_micro": float(metric_values.get("f1_micro", 0.0)),
+        }
+
+    valid_coarse_metrics = compute_classification_metrics(y_valid_c, valid_coarse_pred)
+    test_coarse_metrics = compute_classification_metrics(y_test_c, test_coarse_pred)
     intermediate_rows = [
-        {
-            "split": "valid",
-            "stage": "coarse",
-            "accuracy": float(compute_classification_metrics(y_valid_c, valid_coarse_pred)["accuracy"]),
-        },
-        {"split": "valid", "stage": "fine_flat", "accuracy": float(valid_flat_metrics["accuracy"])},
-        {"split": "valid", "stage": "fine_hier", "accuracy": float(valid_hier_metrics["accuracy"])},
-        {
-            "split": "test",
-            "stage": "coarse",
-            "accuracy": float(compute_classification_metrics(y_test_c, test_coarse_pred)["accuracy"]),
-        },
-        {"split": "test", "stage": "fine_flat", "accuracy": float(test_flat_metrics["accuracy"])},
-        {"split": "test", "stage": "fine_hier", "accuracy": float(test_hier_metrics["accuracy"])},
+        intermediate_row("valid", "coarse", valid_coarse_metrics),
+        intermediate_row("valid", "fine_flat", valid_flat_metrics),
+        intermediate_row("valid", "fine_hier", valid_hier_metrics),
+        intermediate_row("test", "coarse", test_coarse_metrics),
+        intermediate_row("test", "fine_flat", test_flat_metrics),
+        intermediate_row("test", "fine_hier", test_hier_metrics),
     ]
 
     metrics = {
@@ -644,6 +673,9 @@ def main() -> None:
             "eval_batch_size": args.eval_batch_size,
             "gradient_accumulation_steps": args.gradient_accumulation_steps,
             "seed": args.seed,
+            "max_train_samples": args.max_train_samples,
+            "max_valid_samples": args.max_valid_samples,
+            "max_test_samples": args.max_test_samples,
             "optimize_profile": args.optimize_profile,
             "loss": args.loss,
             "label_smoothing": args.label_smoothing,
@@ -653,12 +685,12 @@ def main() -> None:
             "prefetch_factor": args.prefetch_factor,
         },
         "valid": {
-            "coarse": compute_classification_metrics(y_valid_c, valid_coarse_pred),
+            "coarse": valid_coarse_metrics,
             "fine_flat": valid_flat_metrics,
             "fine_hier": valid_hier_metrics,
         },
         "test": {
-            "coarse": compute_classification_metrics(y_test_c, test_coarse_pred),
+            "coarse": test_coarse_metrics,
             "fine_flat": test_flat_metrics,
             "fine_hier": test_hier_metrics,
         },
@@ -713,6 +745,17 @@ def main() -> None:
     (args.output_dir / "model_bundle.json").write_text(
         json.dumps(model_bundle, ensure_ascii=False, indent=2),
         encoding="utf-8",
+    )
+    np.savez_compressed(
+        args.output_dir / "eval_outputs.npz",
+        y_valid=y_valid_f.astype(np.int64),
+        valid_logits=valid_flat_logits.astype(np.float32),
+        valid_pred=valid_hier_pred.astype(np.int64),
+        y_test=y_test_f.astype(np.int64),
+        test_logits=test_flat_logits.astype(np.float32),
+        test_pred=test_hier_pred.astype(np.int64),
+        valid_coarse_logits=valid_coarse_logits.astype(np.float32),
+        test_coarse_logits=test_coarse_logits.astype(np.float32),
     )
     (args.output_dir / "fine_label2id.json").write_text(json.dumps(fine_l2i, ensure_ascii=False, indent=2), encoding="utf-8")
     (args.output_dir / "coarse_label2id.json").write_text(json.dumps(coarse_l2i, ensure_ascii=False, indent=2), encoding="utf-8")

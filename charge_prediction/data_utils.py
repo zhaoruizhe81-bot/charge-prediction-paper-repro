@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from .constants import CHAPTER_RANGES, DEFAULT_RANDOM_SEED, PAPER_TOP_LEVEL_CATEGORIES, UNKNOWN_CATEGORY
@@ -73,6 +74,21 @@ def extract_first_int(value: Any) -> int | None:
             if int_value is not None:
                 return int_value
     return None
+
+
+def extract_int_list(value: Any) -> list[int]:
+    if value is None:
+        return []
+    if isinstance(value, int):
+        return [int(value)]
+    if isinstance(value, str):
+        return [int(item) for item in re.findall(r"\d+", value)]
+    if isinstance(value, list):
+        numbers: list[int] = []
+        for item in value:
+            numbers.extend(extract_int_list(item))
+        return sorted(set(numbers))
+    return []
 
 
 def article_to_category(article_number: int | None) -> str:
@@ -155,6 +171,57 @@ def parse_single_label_cail_split(
         )
 
     return pd.DataFrame(rows)
+
+
+def parse_law_article_split(path: str | Path) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for record in read_jsonl(path):
+        meta = record.get("meta", {})
+        articles = extract_int_list(meta.get("relevant_articles"))
+        if not articles:
+            continue
+
+        fact = anonymize_criminals(record.get("fact", ""), meta.get("criminals", []))
+        fact = clean_fact_text(fact)
+        if not fact:
+            continue
+
+        accusation_list = meta.get("accusation", []) or []
+        accusation_list = [normalize_accusation(item) for item in accusation_list if normalize_accusation(item)]
+        rows.append(
+            {
+                "fact": fact,
+                "article_numbers": articles,
+                "primary_article": int(articles[0]),
+                "article_count": int(len(articles)),
+                "accusation_list": accusation_list,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def build_multilabel_matrix(label_lists: pd.Series, label2id: dict[str, int] | dict[int, int]) -> np.ndarray:
+    matrix = np.zeros((len(label_lists), len(label2id)), dtype=np.float32)
+    for row_idx, labels in enumerate(label_lists.tolist()):
+        if not isinstance(labels, list):
+            continue
+        for label in labels:
+            if label in label2id:
+                matrix[row_idx, int(label2id[label])] = 1.0
+            elif str(label) in label2id:
+                matrix[row_idx, int(label2id[str(label)])] = 1.0
+    return matrix
+
+
+def filter_rows_by_labels(dataframe: pd.DataFrame, label_set: set[int]) -> pd.DataFrame:
+    result = dataframe.copy()
+    result["article_numbers"] = result["article_numbers"].apply(
+        lambda labels: [int(label) for label in labels if int(label) in label_set]
+    )
+    result = result[result["article_numbers"].apply(bool)].reset_index(drop=True)
+    result["primary_article"] = result["article_numbers"].apply(lambda labels: int(labels[0]))
+    result["article_count"] = result["article_numbers"].apply(len)
+    return result
 
 
 def _compute_target_counts(label_counts: pd.Series, total_samples: int) -> dict[str, int]:
