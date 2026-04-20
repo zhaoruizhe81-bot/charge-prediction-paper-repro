@@ -621,15 +621,19 @@ def main() -> None:
 
     test_probs = softmax(test_coarse_logits)
     test_coarse_conf, test_coarse_margin = top1_and_margin(test_probs)
-    test_hier_pred, test_routing_stats = apply_gating(
-        flat_pred=test_flat_pred,
-        routed_pred=test_routed_pred,
-        coarse_confidence=test_coarse_conf,
-        coarse_margin=test_coarse_margin,
-        confidence_threshold=float(routing_config.get("coarse_threshold") or 0.0),
-        margin_threshold=float(routing_config.get("coarse_margin_threshold") or 0.0),
-        fallback_to_flat=bool(routing_config.get("fallback_to_flat", False)),
-    )
+    if not bool(routing_config.get("use_hierarchical_routing", False)):
+        test_hier_pred = np.array(test_flat_pred, copy=True)
+        test_routing_stats = {"num_routed": 0, "num_fallback": int(len(test_flat_pred))}
+    else:
+        test_hier_pred, test_routing_stats = apply_gating(
+            flat_pred=test_flat_pred,
+            routed_pred=test_routed_pred,
+            coarse_confidence=test_coarse_conf,
+            coarse_margin=test_coarse_margin,
+            confidence_threshold=float(routing_config.get("coarse_threshold") or 0.0),
+            margin_threshold=float(routing_config.get("coarse_margin_threshold") or 0.0),
+            fallback_to_flat=bool(routing_config.get("fallback_to_flat", False)),
+        )
 
     valid_flat_metrics = compute_classification_metrics(y_valid_f, valid_flat_pred)
     test_flat_metrics = compute_classification_metrics(y_test_f, test_flat_pred)
