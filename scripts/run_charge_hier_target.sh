@@ -17,13 +17,13 @@ BERT_DIR="${BERT_DIR:-chinese-bert-wwm-ext}"
 REUSE_FLAT_DIR="${REUSE_FLAT_DIR:-$ROOT_DIR/outputs_overnight/latest/deep_models}"
 
 EPOCHS="${EPOCHS:-4}"
-MAX_LENGTH="${MAX_LENGTH:-256}"
+MAX_LENGTH="${MAX_LENGTH:-384}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-4}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-8}"
 GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-2}"
 DEVICE="${DEVICE:-cuda}"
 TARGET_MODELS="${TARGET_MODELS:-rcnn}"
-TARGET_SEEDS="${TARGET_SEEDS:-42 2024 3407}"
+TARGET_SEEDS="${TARGET_SEEDS:-2024}"
 
 usage() {
   cat <<'EOF'
@@ -32,7 +32,7 @@ Usage:
   scripts/run_charge_hier_target.sh --foreground
 
 Environment overrides:
-  EPOCHS=4 MAX_LENGTH=256 TARGET_MODELS="rcnn fc" TARGET_SEEDS="42 2024 3407"
+  EPOCHS=4 MAX_LENGTH=384 TARGET_MODELS="rcnn" TARGET_SEEDS="2024"
   REUSE_FLAT_DIR=/path/to/previous/deep_models
 EOF
 }
