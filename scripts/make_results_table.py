@@ -109,23 +109,27 @@ def collect_law_rows(rows: list[dict[str, str | float]], output_dir: Path) -> li
     for model_name, model_metrics in law_deep.items():
         rows.append(metric_row("law_recommendation", model_name, "flat", "law_deep", model_metrics.get("test", {})))
 
-    law_hier = load_json(output_dir / "law_hierarchical" / "metrics.json")
-    if law_hier:
+    for path in sorted(output_dir.glob("law_hierarchical*/metrics.json")):
+        law_hier = load_json(path)
+        if not law_hier:
+            continue
+        source = path.parent.name
+        suffix = "" if source == "law_hierarchical" else "_" + source.replace("law_hierarchical_", "")
         model_name = str(law_hier.get("config", {}).get("base_model", "law"))
-        rows.append(metric_row("law_recommendation", model_name, "flat", "law_hierarchical", law_hier.get("test", {}).get("flat_law", {})))
+        rows.append(metric_row("law_recommendation", model_name, "flat", source, law_hier.get("test", {}).get("flat_law", {})))
         for metric_key, variant_name in [
             ("fine_hier", "hier"),
             ("fine_hier_accuracy", "hier_accuracy"),
             ("fine_hier_f1", "hier_f1"),
         ]:
             if metric_key in law_hier.get("test", {}):
-                rows.append(metric_row("law_recommendation", model_name, variant_name, "law_hierarchical", law_hier.get("test", {}).get(metric_key, {})))
+                rows.append(metric_row("law_recommendation", model_name, f"{variant_name}{suffix}", source, law_hier.get("test", {}).get(metric_key, {})))
         for item in law_hier.get("intermediate_rows", []):
             intermediate_rows.append(
                 {
                     "task": "law_recommendation",
                     "model": model_name,
-                    "source": "law_hierarchical",
+                    "source": source,
                     "split": item.get("split", ""),
                     "stage": item.get("stage", ""),
                     "accuracy": float(item.get("accuracy", 0.0)),
