@@ -193,6 +193,8 @@ def main() -> None:
     weight_candidates = parse_weight_candidates(args.weights, len(args.models))
 
     best: dict[str, object] | None = None
+    best_accuracy: dict[str, object] | None = None
+    best_f1: dict[str, object] | None = None
     for weights in weight_candidates:
         fused_valid_scores = fuse_scores(valid_scores_list, weights)
         for threshold in args.thresholds:
@@ -205,37 +207,67 @@ def main() -> None:
             )
             metrics = compute_multilabel_metrics(y_valid, valid_pred)
             score = objective_score(metrics, base_valid_metrics, args)
+            candidate = {
+                "weights": weights,
+                "confusing_threshold": float(threshold),
+                "valid": metrics,
+                "valid_pred": valid_pred,
+                "fused_valid_scores": fused_valid_scores,
+                "score": score,
+            }
             best_score = best.get("score") if best is not None else None
             if best is None or score > best_score:
-                best = {
-                    "weights": weights,
-                    "confusing_threshold": float(threshold),
-                    "valid": metrics,
-                    "valid_pred": valid_pred,
-                    "fused_valid_scores": fused_valid_scores,
-                    "score": score,
-                }
+                best = candidate
+            if best_accuracy is None or (
+                float(metrics["accuracy"]),
+                float(metrics["f1_score"]),
+                float(metrics["recall_macro"]),
+            ) > (
+                float(best_accuracy["valid"]["accuracy"]),
+                float(best_accuracy["valid"]["f1_score"]),
+                float(best_accuracy["valid"]["recall_macro"]),
+            ):
+                best_accuracy = candidate
+            if best_f1 is None or (
+                float(metrics["f1_score"]),
+                float(metrics["accuracy"]),
+                float(metrics["recall_macro"]),
+            ) > (
+                float(best_f1["valid"]["f1_score"]),
+                float(best_f1["valid"]["accuracy"]),
+                float(best_f1["valid"]["recall_macro"]),
+            ):
+                best_f1 = candidate
 
     if best is None:
         raise RuntimeError("No hierarchical fusion candidate was evaluated.")
 
-    fused_test_scores = fuse_scores(test_scores_list, np.asarray(best["weights"], dtype=np.float64))
-    test_pred = apply_hierarchical_prediction(
-        base_test_scores,
-        fused_test_scores,
-        confusing_ids,
-        base_threshold=base_threshold,
-        confusing_threshold=float(best["confusing_threshold"]),
-    )
-    test_metrics = compute_multilabel_metrics(y_test, test_pred)
+    def evaluate_candidate(candidate: dict[str, object]) -> tuple[np.ndarray, np.ndarray, dict[str, float]]:
+        fused_scores = fuse_scores(test_scores_list, np.asarray(candidate["weights"], dtype=np.float64))
+        pred = apply_hierarchical_prediction(
+            base_test_scores,
+            fused_scores,
+            confusing_ids,
+            base_threshold=base_threshold,
+            confusing_threshold=float(candidate["confusing_threshold"]),
+        )
+        return fused_scores, pred, compute_multilabel_metrics(y_test, pred)
+
+    fused_test_scores, test_pred, test_metrics = evaluate_candidate(best)
+    accuracy_test_scores, accuracy_test_pred, accuracy_test_metrics = evaluate_candidate(best_accuracy or best)
+    f1_test_scores, f1_test_pred, f1_test_metrics = evaluate_candidate(best_f1 or best)
 
     intermediate_rows = [
         {"split": "valid", "stage": "flat_law", **base_valid_metrics},
         {"split": "valid", "stage": "first_layer_confusing", **binary_confusing_metrics(y_valid, base_valid_pred, confusing_ids)},
         {"split": "valid", "stage": "final_hier_fusion", **best["valid"]},
+        {"split": "valid", "stage": "final_hier_accuracy", **(best_accuracy or best)["valid"]},
+        {"split": "valid", "stage": "final_hier_f1", **(best_f1 or best)["valid"]},
         {"split": "test", "stage": "flat_law", **base_test_metrics},
         {"split": "test", "stage": "first_layer_confusing", **binary_confusing_metrics(y_test, base_test_pred, confusing_ids)},
         {"split": "test", "stage": "final_hier_fusion", **test_metrics},
+        {"split": "test", "stage": "final_hier_accuracy", **accuracy_test_metrics},
+        {"split": "test", "stage": "final_hier_f1", **f1_test_metrics},
     ]
     pd.DataFrame(intermediate_rows).to_csv(args.output_dir / "intermediate_metrics.csv", index=False, encoding="utf-8-sig")
     pd.DataFrame(compute_multilabel_per_label_metrics(y_test, test_pred, id2label=id2label)).to_csv(
@@ -275,8 +307,27 @@ def main() -> None:
         "test": {
             "flat_law": base_test_metrics,
             "fine_hier": test_metrics,
+            "fine_hier_accuracy": accuracy_test_metrics,
+            "fine_hier_f1": f1_test_metrics,
         },
         "intermediate_rows": intermediate_rows,
+        "variant_configs": {
+            "fine_hier": {
+                "weights": [float(item) for item in np.asarray(best["weights"], dtype=float).tolist()],
+                "confusing_threshold": float(best["confusing_threshold"]),
+                "valid": best["valid"],
+            },
+            "fine_hier_accuracy": {
+                "weights": [float(item) for item in np.asarray((best_accuracy or best)["weights"], dtype=float).tolist()],
+                "confusing_threshold": float((best_accuracy or best)["confusing_threshold"]),
+                "valid": (best_accuracy or best)["valid"],
+            },
+            "fine_hier_f1": {
+                "weights": [float(item) for item in np.asarray((best_f1 or best)["weights"], dtype=float).tolist()],
+                "confusing_threshold": float((best_f1 or best)["confusing_threshold"]),
+                "valid": (best_f1 or best)["valid"],
+            },
+        },
     }
     (args.output_dir / "metrics.json").write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
     print("[Done] law hierarchical fusion finished")

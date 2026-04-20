@@ -113,7 +113,13 @@ def collect_law_rows(rows: list[dict[str, str | float]], output_dir: Path) -> li
     if law_hier:
         model_name = str(law_hier.get("config", {}).get("base_model", "law"))
         rows.append(metric_row("law_recommendation", model_name, "flat", "law_hierarchical", law_hier.get("test", {}).get("flat_law", {})))
-        rows.append(metric_row("law_recommendation", model_name, "hier", "law_hierarchical", law_hier.get("test", {}).get("fine_hier", {})))
+        for metric_key, variant_name in [
+            ("fine_hier", "hier"),
+            ("fine_hier_accuracy", "hier_accuracy"),
+            ("fine_hier_f1", "hier_f1"),
+        ]:
+            if metric_key in law_hier.get("test", {}):
+                rows.append(metric_row("law_recommendation", model_name, variant_name, "law_hierarchical", law_hier.get("test", {}).get(metric_key, {})))
         for item in law_hier.get("intermediate_rows", []):
             intermediate_rows.append(
                 {
@@ -149,7 +155,7 @@ def build_contrast_table(table: pd.DataFrame) -> pd.DataFrame:
     grouped = table.groupby(["task", "model"], dropna=False)
     for (task, model), group in grouped:
         flat_rows = group[group["variant"] == "flat"]
-        hier_rows = group[group["variant"] == "hier"]
+        hier_rows = group[group["variant"].astype(str).str.startswith("hier")]
         if flat_rows.empty or hier_rows.empty:
             continue
         flat = flat_rows.iloc[0]
@@ -160,7 +166,7 @@ def build_contrast_table(table: pd.DataFrame) -> pd.DataFrame:
                 "family": "DL",
                 "model": model,
                 "base_variant": "flat",
-                "hier_variant": "hier",
+                "hier_variant": str(hier["variant"]),
                 "base_accuracy": float(flat["accuracy"]),
                 "hier_accuracy": float(hier["accuracy"]),
                 "delta_accuracy": float(hier["accuracy"] - flat["accuracy"]),
@@ -184,11 +190,11 @@ def build_best_contrast_table(table: pd.DataFrame) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
     for task, group in table.groupby("task", dropna=False):
         flat_rows = group[group["variant"] == "flat"]
-        hier_rows = group[group["variant"] == "hier"]
+        hier_rows = group[group["variant"].astype(str).str.startswith("hier")]
         if flat_rows.empty or hier_rows.empty:
             continue
-        flat = flat_rows.sort_values(by=["f1_score", "accuracy"], ascending=False).iloc[0]
-        hier = hier_rows.sort_values(by=["f1_score", "accuracy"], ascending=False).iloc[0]
+        flat = flat_rows.sort_values(by=["accuracy", "f1_score"], ascending=False).iloc[0]
+        hier = hier_rows.sort_values(by=["accuracy", "f1_score"], ascending=False).iloc[0]
         rows.append(
             {
                 "task": task,
