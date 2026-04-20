@@ -75,6 +75,12 @@ def parse_args() -> argparse.Namespace:
         choices=["routing", "flat_local_coarse"],
     )
     parser.add_argument(
+        "--hier-objective",
+        type=str,
+        default="balanced",
+        choices=["metric", "accuracy", "recall", "balanced"],
+    )
+    parser.add_argument(
         "--coarse-fusion-weights",
         type=float,
         nargs="*",
@@ -404,6 +410,7 @@ def tune_flat_local_coarse_fusion(
     fine_to_coarse: np.ndarray,
     *,
     metric_name: str,
+    objective: str,
     coarse_weights: list[float],
     local_weights: list[float],
 ) -> tuple[dict[str, object], np.ndarray, dict[str, float]]:
@@ -411,6 +418,7 @@ def tune_flat_local_coarse_fusion(
     coarse_fine_log_probs = coarse_log_probs_for_fine_labels(coarse_logits, fine_to_coarse)
     best_pred = np.argmax(flat_log_probs, axis=1)
     best_metrics = compute_classification_metrics(y_true, best_pred)
+    best_score = hierarchy_objective_score(best_metrics, objective, metric_name)
     best_config: dict[str, object] = {
         "use_hierarchical_routing": False,
         "fusion_mode": "flat_baseline",
@@ -425,16 +433,33 @@ def tune_flat_local_coarse_fusion(
             scores = flat_log_probs + coarse_weight * coarse_fine_log_probs + local_weight * local_log_probs
             pred = np.argmax(scores, axis=1)
             metrics = compute_classification_metrics(y_true, pred)
-            if is_better(metrics, best_metrics, metric_name):
+            score = hierarchy_objective_score(metrics, objective, metric_name)
+            if score > best_score:
                 best_pred = pred
                 best_metrics = metrics
+                best_score = score
                 best_config = {
                     "use_hierarchical_routing": True,
                     "fusion_mode": "flat_local_coarse",
+                    "objective": objective,
                     "coarse_weight": float(coarse_weight),
                     "local_weight": float(local_weight),
                 }
     return best_config, best_pred, best_metrics
+
+
+def hierarchy_objective_score(metrics: dict[str, float], objective: str, metric_name: str) -> tuple[float, ...]:
+    accuracy = float(metrics.get("accuracy", 0.0))
+    recall_macro = float(metrics.get("recall_macro", 0.0))
+    recall_micro = float(metrics.get("recall_micro", 0.0))
+    f1_score = float(metrics.get("f1_score", 0.0))
+    if objective == "accuracy":
+        return (accuracy, f1_score, recall_macro, recall_micro)
+    if objective == "recall":
+        return (recall_macro + recall_micro, accuracy, f1_score)
+    if objective == "balanced":
+        return (accuracy + f1_score + 0.5 * recall_macro + 0.25 * recall_micro, accuracy, f1_score)
+    return (float(metrics.get(metric_name, 0.0)), accuracy, f1_score)
 
 
 def apply_flat_local_coarse_fusion(
@@ -797,6 +822,40 @@ def main() -> None:
             local_log_probs=valid_local_log_probs,
             fine_to_coarse=fine_to_coarse,
             metric_name=fine_config.selection_metric,
+            objective=args.hier_objective,
+            coarse_weights=args.coarse_fusion_weights,
+            local_weights=args.local_fusion_weights,
+        )
+        accuracy_config, valid_hier_accuracy_pred, valid_hier_accuracy_metrics = tune_flat_local_coarse_fusion(
+            y_true=y_valid_f,
+            flat_logits=valid_flat_logits,
+            coarse_logits=valid_coarse_logits,
+            local_log_probs=valid_local_log_probs,
+            fine_to_coarse=fine_to_coarse,
+            metric_name="accuracy",
+            objective="accuracy",
+            coarse_weights=args.coarse_fusion_weights,
+            local_weights=args.local_fusion_weights,
+        )
+        recall_config, valid_hier_recall_pred, valid_hier_recall_metrics = tune_flat_local_coarse_fusion(
+            y_true=y_valid_f,
+            flat_logits=valid_flat_logits,
+            coarse_logits=valid_coarse_logits,
+            local_log_probs=valid_local_log_probs,
+            fine_to_coarse=fine_to_coarse,
+            metric_name="recall_macro",
+            objective="recall",
+            coarse_weights=args.coarse_fusion_weights,
+            local_weights=args.local_fusion_weights,
+        )
+        balanced_config, valid_hier_balanced_pred, valid_hier_balanced_metrics = tune_flat_local_coarse_fusion(
+            y_true=y_valid_f,
+            flat_logits=valid_flat_logits,
+            coarse_logits=valid_coarse_logits,
+            local_log_probs=valid_local_log_probs,
+            fine_to_coarse=fine_to_coarse,
+            metric_name=fine_config.selection_metric,
+            objective="balanced",
             coarse_weights=args.coarse_fusion_weights,
             local_weights=args.local_fusion_weights,
         )
@@ -806,6 +865,27 @@ def main() -> None:
             test_local_log_probs,
             fine_to_coarse,
             routing_config,
+        )
+        test_hier_accuracy_pred, _ = apply_flat_local_coarse_fusion(
+            test_flat_logits,
+            test_coarse_logits,
+            test_local_log_probs,
+            fine_to_coarse,
+            accuracy_config,
+        )
+        test_hier_recall_pred, _ = apply_flat_local_coarse_fusion(
+            test_flat_logits,
+            test_coarse_logits,
+            test_local_log_probs,
+            fine_to_coarse,
+            recall_config,
+        )
+        test_hier_balanced_pred, _ = apply_flat_local_coarse_fusion(
+            test_flat_logits,
+            test_coarse_logits,
+            test_local_log_probs,
+            fine_to_coarse,
+            balanced_config,
         )
         valid_routing_stats = {
             "num_routed": int(len(valid_hier_pred)) if bool(routing_config.get("use_hierarchical_routing", False)) else 0,
@@ -837,10 +917,25 @@ def main() -> None:
                 margin_threshold=float(routing_config.get("coarse_margin_threshold") or 0.0),
                 fallback_to_flat=bool(routing_config.get("fallback_to_flat", False)),
             )
+        accuracy_config = dict(routing_config)
+        recall_config = dict(routing_config)
+        balanced_config = dict(routing_config)
+        valid_hier_accuracy_pred = np.array(valid_hier_pred, copy=True)
+        valid_hier_recall_pred = np.array(valid_hier_pred, copy=True)
+        valid_hier_balanced_pred = np.array(valid_hier_pred, copy=True)
+        valid_hier_accuracy_metrics = dict(valid_hier_metrics)
+        valid_hier_recall_metrics = dict(valid_hier_metrics)
+        valid_hier_balanced_metrics = dict(valid_hier_metrics)
+        test_hier_accuracy_pred = np.array(test_hier_pred, copy=True)
+        test_hier_recall_pred = np.array(test_hier_pred, copy=True)
+        test_hier_balanced_pred = np.array(test_hier_pred, copy=True)
 
     valid_flat_metrics = compute_classification_metrics(y_valid_f, valid_flat_pred)
     test_flat_metrics = compute_classification_metrics(y_test_f, test_flat_pred)
     test_hier_metrics = compute_classification_metrics(y_test_f, test_hier_pred)
+    test_hier_accuracy_metrics = compute_classification_metrics(y_test_f, test_hier_accuracy_pred)
+    test_hier_recall_metrics = compute_classification_metrics(y_test_f, test_hier_recall_pred)
+    test_hier_balanced_metrics = compute_classification_metrics(y_test_f, test_hier_balanced_pred)
     routing_note = build_routing_note(routing_config)
 
     def intermediate_row(split: str, stage: str, metric_values: dict[str, float]) -> dict[str, object]:
@@ -861,9 +956,15 @@ def main() -> None:
         intermediate_row("valid", "coarse", valid_coarse_metrics),
         intermediate_row("valid", "fine_flat", valid_flat_metrics),
         intermediate_row("valid", "fine_hier", valid_hier_metrics),
+        intermediate_row("valid", "fine_hier_accuracy", valid_hier_accuracy_metrics),
+        intermediate_row("valid", "fine_hier_recall", valid_hier_recall_metrics),
+        intermediate_row("valid", "fine_hier_balanced", valid_hier_balanced_metrics),
         intermediate_row("test", "coarse", test_coarse_metrics),
         intermediate_row("test", "fine_flat", test_flat_metrics),
         intermediate_row("test", "fine_hier", test_hier_metrics),
+        intermediate_row("test", "fine_hier_accuracy", test_hier_accuracy_metrics),
+        intermediate_row("test", "fine_hier_recall", test_hier_recall_metrics),
+        intermediate_row("test", "fine_hier_balanced", test_hier_balanced_metrics),
     ]
 
     metrics = {
@@ -885,6 +986,7 @@ def main() -> None:
             "max_test_samples": args.max_test_samples,
             "local_init_from_flat": args.local_init_from_flat,
             "hier_fusion_mode": args.hier_fusion_mode,
+            "hier_objective": args.hier_objective,
             "coarse_fusion_weights": args.coarse_fusion_weights,
             "local_fusion_weights": args.local_fusion_weights,
             "optimize_profile": args.optimize_profile,
@@ -899,13 +1001,25 @@ def main() -> None:
             "coarse": valid_coarse_metrics,
             "fine_flat": valid_flat_metrics,
             "fine_hier": valid_hier_metrics,
+            "fine_hier_accuracy": valid_hier_accuracy_metrics,
+            "fine_hier_recall": valid_hier_recall_metrics,
+            "fine_hier_balanced": valid_hier_balanced_metrics,
         },
         "test": {
             "coarse": test_coarse_metrics,
             "fine_flat": test_flat_metrics,
             "fine_hier": test_hier_metrics,
+            "fine_hier_accuracy": test_hier_accuracy_metrics,
+            "fine_hier_recall": test_hier_recall_metrics,
+            "fine_hier_balanced": test_hier_balanced_metrics,
         },
         "routing_config": routing_config,
+        "variant_configs": {
+            "fine_hier": routing_config,
+            "fine_hier_accuracy": accuracy_config,
+            "fine_hier_recall": recall_config,
+            "fine_hier_balanced": balanced_config,
+        },
         "routing_note": routing_note,
         "routing_stats": {
             "valid": valid_routing_stats,
@@ -978,6 +1092,9 @@ def main() -> None:
         variants={
             "fine_flat": test_flat_pred,
             "fine_hier": test_hier_pred,
+            "fine_hier_accuracy": test_hier_accuracy_pred,
+            "fine_hier_recall": test_hier_recall_pred,
+            "fine_hier_balanced": test_hier_balanced_pred,
         },
     )
     routing_diagnostics = {
@@ -1012,6 +1129,9 @@ def main() -> None:
     print("[Test coarse   ]", metrics["test"]["coarse"])
     print("[Test fine-flat]", metrics["test"]["fine_flat"])
     print("[Test fine-hier]", metrics["test"]["fine_hier"])
+    print("[Test hier-acc ]", metrics["test"]["fine_hier_accuracy"])
+    print("[Test hier-rec ]", metrics["test"]["fine_hier_recall"])
+    print("[Test hier-bal ]", metrics["test"]["fine_hier_balanced"])
 
 
 if __name__ == "__main__":

@@ -85,7 +85,14 @@ def collect_hier_rows(rows: list[dict[str, str | float]], output_dir: Path) -> l
         metrics = load_json(path)
         model_name = infer_model_name(path, metrics)
         rows.append(metric_row("charge_prediction", model_name, "flat", path.parent.name, metrics.get("test", {}).get("fine_flat", {})))
-        rows.append(metric_row("charge_prediction", model_name, "hier", path.parent.name, metrics.get("test", {}).get("fine_hier", {})))
+        for metric_key, variant_name in [
+            ("fine_hier", "hier"),
+            ("fine_hier_accuracy", "hier_accuracy"),
+            ("fine_hier_recall", "hier_recall"),
+            ("fine_hier_balanced", "hier_balanced"),
+        ]:
+            if metric_key in metrics.get("test", {}):
+                rows.append(metric_row("charge_prediction", model_name, variant_name, path.parent.name, metrics.get("test", {}).get(metric_key, {})))
         for item in metrics.get("intermediate_rows", []):
             intermediate_rows.append(
                 {
