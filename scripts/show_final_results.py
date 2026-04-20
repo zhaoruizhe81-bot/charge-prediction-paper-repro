@@ -204,6 +204,15 @@ def write_requirement_check(output_dir: Path, export_dir: Path, auc_table: pd.Da
                     "detail": f"max_delta_accuracy={max_delta:.6f}",
                 }
             )
+            charge_rows = contrast[contrast["task"] == "charge_prediction"] if "task" in contrast.columns else pd.DataFrame()
+            charge_delta = float(charge_rows["delta_accuracy"].max()) if not charge_rows.empty else 0.0
+            checks.append(
+                {
+                    "requirement": "Charge hierarchical accuracy gain is at least 2%",
+                    "status": "PASS" if charge_delta >= 0.02 else "FAIL",
+                    "detail": f"charge_delta_accuracy={charge_delta:.6f}",
+                }
+            )
         if "delta_f1_score" in contrast.columns:
             max_delta = float(contrast["delta_f1_score"].max()) if not contrast.empty else 0.0
             checks.append(

@@ -50,6 +50,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-prepare", action="store_true")
     parser.add_argument("--skip-flat", action="store_true")
     parser.add_argument("--skip-hier", action="store_true")
+    parser.add_argument("--include-charge-multitask", action="store_true")
+    parser.add_argument("--charge-multitask-models", nargs="+", default=["rcnn"])
+    parser.add_argument("--charge-multitask-seeds", nargs="+", type=int, default=[42, 2024, 3407])
+    parser.add_argument("--charge-multitask-epochs", type=int, default=0)
     parser.add_argument("--include-law", action="store_true")
     parser.add_argument("--skip-law-prepare", action="store_true")
     parser.add_argument("--skip-law-deep", action="store_true")
@@ -125,9 +129,6 @@ def main() -> None:
                 str(args.gradient_accumulation_steps),
                 "--seed",
                 str(args.seed),
-                "--local-init-from-flat",
-                "--hier-fusion-mode",
-                "flat_local_coarse",
                 *optimization_args(args),
             ]
         )
@@ -169,6 +170,51 @@ def main() -> None:
             if fine_ckpt.exists():
                 cmd.extend(["--fine-checkpoint", str(fine_ckpt)])
             run(cmd)
+
+    if args.include_charge_multitask:
+        run(
+            [
+                sys.executable,
+                str(ROOT_DIR / "scripts" / "train_charge_hier_multitask.py"),
+                "--data-dir",
+                str(args.processed_dir),
+                "--output-dir",
+                str(args.output_dir / "charge_hier_multitask"),
+                "--flat-dir",
+                str(args.output_dir / "deep_models"),
+                "--models",
+                *args.charge_multitask_models,
+                "--seeds",
+                *[str(seed) for seed in args.charge_multitask_seeds],
+                "--device",
+                args.device,
+                "--pretrained-model",
+                args.pretrained_model,
+                "--epochs",
+                str(args.charge_multitask_epochs or args.epochs),
+                "--max-length",
+                str(args.max_length),
+                "--train-batch-size",
+                str(args.train_batch_size),
+                "--eval-batch-size",
+                str(args.eval_batch_size),
+                "--gradient-accumulation-steps",
+                str(args.gradient_accumulation_steps),
+                "--loss",
+                args.loss or "weighted_ce",
+                "--label-smoothing",
+                str(args.label_smoothing if args.label_smoothing >= 0 else 0.05),
+                "--sampler",
+                args.sampler or "none",
+                "--optimize-profile",
+                args.optimize_profile,
+                "--pin-memory",
+                args.pin_memory,
+                "--persistent-workers",
+                args.persistent_workers,
+                *([] if args.prefetch_factor <= 0 else ["--prefetch-factor", str(args.prefetch_factor)]),
+            ]
+        )
 
     if args.include_law:
         if not args.skip_law_prepare:

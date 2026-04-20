@@ -110,6 +110,59 @@ def collect_hier_rows(rows: list[dict[str, str | float]], output_dir: Path) -> l
     return intermediate_rows
 
 
+def collect_charge_multitask_rows(rows: list[dict[str, str | float]], output_dir: Path) -> list[dict[str, object]]:
+    intermediate_rows: list[dict[str, object]] = []
+    for path in sorted(output_dir.glob("charge_hier_multitask*/metrics.json")):
+        metrics = load_json(path)
+        if not metrics:
+            continue
+        source = path.parent.name
+        model_name = "multitask_ensemble"
+        for metric_key, variant_name in [
+            ("fine_hier", "hier_multitask"),
+            ("fine_hier_accuracy", "hier_multitask_accuracy"),
+            ("fine_hier_recall", "hier_multitask_recall"),
+            ("fine_hier_balanced", "hier_multitask_balanced"),
+        ]:
+            if metric_key in metrics.get("test", {}):
+                rows.append(
+                    metric_row(
+                        "charge_prediction",
+                        model_name,
+                        variant_name,
+                        source,
+                        metrics.get("test", {}).get(metric_key, {}),
+                    )
+                )
+        for run_name, run_metrics in metrics.get("runs", {}).items():
+            run_model = str(run_metrics.get("model", run_name))
+            if "fine" in run_metrics.get("test", {}):
+                rows.append(
+                    metric_row(
+                        "charge_prediction",
+                        f"{run_model}_mt",
+                        "hier_multitask_single",
+                        run_name,
+                        run_metrics.get("test", {}).get("fine", {}),
+                    )
+                )
+        for item in metrics.get("intermediate_rows", []):
+            intermediate_rows.append(
+                {
+                    "task": "charge_prediction",
+                    "model": item.get("model", model_name),
+                    "source": item.get("source", source),
+                    "split": item.get("split", ""),
+                    "stage": item.get("stage", ""),
+                    "accuracy": float(item.get("accuracy", 0.0)),
+                    "recall_macro": float(item.get("recall_macro", 0.0)),
+                    "recall_micro": float(item.get("recall_micro", 0.0)),
+                    "f1_score": float(item.get("f1_score", 0.0)),
+                }
+            )
+    return intermediate_rows
+
+
 def collect_law_rows(rows: list[dict[str, str | float]], output_dir: Path) -> list[dict[str, object]]:
     intermediate_rows: list[dict[str, object]] = []
     law_deep = load_json(output_dir / "law_deep" / "metrics.json")
@@ -238,6 +291,7 @@ def main() -> None:
     rows: list[dict[str, str | float]] = []
     collect_flat_rows(rows, args.output_dir)
     intermediate_rows = collect_hier_rows(rows, args.output_dir)
+    intermediate_rows.extend(collect_charge_multitask_rows(rows, args.output_dir))
     intermediate_rows.extend(collect_law_rows(rows, args.output_dir))
 
     if not rows:
