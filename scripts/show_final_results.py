@@ -136,6 +136,7 @@ def build_markdown(output_dir: Path, export_dir: Path, auc_table: pd.DataFrame) 
     lines = ["# Final Experiment Report", ""]
     result_path = output_dir / "results_table.csv"
     contrast_path = output_dir / "results_table_contrast.csv"
+    best_contrast_path = output_dir / "results_table_best_contrast.csv"
     intermediate_path = output_dir / "results_table_intermediate.csv"
     summary_path = output_dir / "summary.json"
 
@@ -145,6 +146,9 @@ def build_markdown(output_dir: Path, export_dir: Path, auc_table: pd.DataFrame) 
     if contrast_path.exists():
         contrast_table = pd.read_csv(contrast_path)
         lines.extend(["## Flat vs Hierarchical Contrast", "", dataframe_to_markdown(contrast_table), ""])
+    if best_contrast_path.exists():
+        best_contrast_table = pd.read_csv(best_contrast_path)
+        lines.extend(["## Best Flat vs Best Hierarchical Contrast", "", dataframe_to_markdown(best_contrast_table), ""])
     if intermediate_path.exists():
         intermediate_table = pd.read_csv(intermediate_path)
         lines.extend(["## Process Metrics", "", dataframe_to_markdown(intermediate_table), ""])
@@ -159,6 +163,7 @@ def build_markdown(output_dir: Path, export_dir: Path, auc_table: pd.DataFrame) 
             "",
             f"- Main table: `{result_path}`",
             f"- Contrast table: `{contrast_path}`",
+            f"- Best contrast table: `{best_contrast_path}`",
             f"- Intermediate table: `{intermediate_path}`",
             f"- AUC summary: `{export_dir / 'auc_summary.csv'}`",
             f"- ROC figures: `{export_dir / 'roc_auc'}`",
@@ -171,6 +176,7 @@ def write_requirement_check(output_dir: Path, export_dir: Path, auc_table: pd.Da
     checks: list[dict[str, object]] = []
     result_path = output_dir / "results_table.csv"
     contrast_path = output_dir / "results_table_contrast.csv"
+    best_contrast_path = output_dir / "results_table_best_contrast.csv"
     intermediate_path = output_dir / "results_table_intermediate.csv"
 
     if result_path.exists():
@@ -186,8 +192,9 @@ def write_requirement_check(output_dir: Path, export_dir: Path, auc_table: pd.Da
     else:
         checks.append({"requirement": "Main result table exists", "status": "FAIL", "detail": str(result_path)})
 
-    if contrast_path.exists():
-        contrast = pd.read_csv(contrast_path)
+    selected_contrast_path = best_contrast_path if best_contrast_path.exists() else contrast_path
+    if selected_contrast_path.exists():
+        contrast = pd.read_csv(selected_contrast_path)
         if "delta_accuracy" in contrast.columns:
             max_delta = float(contrast["delta_accuracy"].max()) if not contrast.empty else 0.0
             checks.append(
@@ -207,7 +214,7 @@ def write_requirement_check(output_dir: Path, export_dir: Path, auc_table: pd.Da
                 }
             )
     else:
-        checks.append({"requirement": "Flat vs hierarchical contrast table exists", "status": "FAIL", "detail": str(contrast_path)})
+        checks.append({"requirement": "Flat vs hierarchical contrast table exists", "status": "FAIL", "detail": str(selected_contrast_path)})
 
     checks.append(
         {

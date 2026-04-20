@@ -125,6 +125,9 @@ def main() -> None:
                 str(args.gradient_accumulation_steps),
                 "--seed",
                 str(args.seed),
+                "--local-init-from-flat",
+                "--hier-fusion-mode",
+                "flat_local_coarse",
                 *optimization_args(args),
             ]
         )

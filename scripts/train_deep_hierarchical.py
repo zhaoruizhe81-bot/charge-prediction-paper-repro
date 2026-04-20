@@ -10,6 +10,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import torch
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
@@ -66,6 +67,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fallback-to-flat", action="store_true")
     parser.add_argument("--coarse-threshold", type=float, default=-1.0)
     parser.add_argument("--coarse-margin-threshold", type=float, default=-1.0)
+    parser.add_argument("--local-init-from-flat", action="store_true")
+    parser.add_argument(
+        "--hier-fusion-mode",
+        type=str,
+        default="flat_local_coarse",
+        choices=["routing", "flat_local_coarse"],
+    )
+    parser.add_argument(
+        "--coarse-fusion-weights",
+        type=float,
+        nargs="*",
+        default=[0.0, 0.01, 0.03, 0.05, 0.08, 0.1, 0.15, 0.2, 0.3, 0.5, 0.7, 1.0],
+    )
+    parser.add_argument(
+        "--local-fusion-weights",
+        type=float,
+        nargs="*",
+        default=[0.0, 0.1, 0.25, 0.5, 0.75, 1.0],
+    )
     parser.add_argument(
         "--optimize-profile",
         type=str,
@@ -124,6 +144,11 @@ def softmax(x: np.ndarray) -> np.ndarray:
     shifted = x - np.max(x, axis=1, keepdims=True)
     exp = np.exp(shifted)
     return exp / exp.sum(axis=1, keepdims=True).clip(min=1e-12)
+
+
+def log_softmax(x: np.ndarray) -> np.ndarray:
+    probabilities = softmax(x)
+    return np.log(probabilities.clip(min=1e-12))
 
 
 def top1_and_margin(probabilities: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -227,6 +252,8 @@ def train_subset_model(
     train_cache_key: str | None = None,
     valid_cache_key: str | None = None,
     test_cache_key: str | None = None,
+    flat_state_dict: dict[str, torch.Tensor] | None = None,
+    local_id2global_fine_id: dict[int, int] | None = None,
 ) -> tuple[DeepChargeTrainer, dict[str, float], dict[str, float], Path]:
     train_mask = train_labels >= 0
     valid_mask = valid_labels >= 0
@@ -258,9 +285,50 @@ def train_subset_model(
     )
     num_labels = int(np.max(train_labels)) + 1 if train_labels.size else 1
     trainer = DeepChargeTrainer(model_type, num_labels, config, device, class_weights=class_weights)
+    if flat_state_dict is not None and local_id2global_fine_id is not None:
+        initialize_local_model_from_flat(trainer, flat_state_dict, local_id2global_fine_id)
     best_valid, best_path = trainer.fit(train_loader, valid_loader, output_dir)
     test_metrics = trainer.evaluate(test_loader)
     return trainer, best_valid, test_metrics, best_path
+
+
+def initialize_local_model_from_flat(
+    trainer: DeepChargeTrainer,
+    flat_state_dict: dict[str, torch.Tensor],
+    local_id2global_fine_id: dict[int, int],
+) -> None:
+    local_state = trainer.model.state_dict()
+    updated_state: dict[str, torch.Tensor] = {}
+    copied = 0
+    for key, local_value in local_state.items():
+        if key == "classifier.weight" and key in flat_state_dict:
+            source = flat_state_dict[key]
+            if source.ndim == 2 and source.shape[1] == local_value.shape[1]:
+                target = local_value.detach().clone()
+                for local_id, global_id in local_id2global_fine_id.items():
+                    if int(global_id) < source.shape[0] and int(local_id) < target.shape[0]:
+                        target[int(local_id)] = source[int(global_id)].detach().to(target.device)
+                updated_state[key] = target
+                copied += 1
+                continue
+        if key == "classifier.bias" and key in flat_state_dict:
+            source = flat_state_dict[key]
+            if source.ndim == 1:
+                target = local_value.detach().clone()
+                for local_id, global_id in local_id2global_fine_id.items():
+                    if int(global_id) < source.shape[0] and int(local_id) < target.shape[0]:
+                        target[int(local_id)] = source[int(global_id)].detach().to(target.device)
+                updated_state[key] = target
+                copied += 1
+                continue
+        source = flat_state_dict.get(key)
+        if source is not None and tuple(source.shape) == tuple(local_value.shape):
+            updated_state[key] = source.detach().to(local_value.device)
+            copied += 1
+        else:
+            updated_state[key] = local_value
+    trainer.model.load_state_dict(updated_state)
+    print(f"[Local init] copied {copied} tensors from flat checkpoint")
 
 
 def routed_predictions(
@@ -287,6 +355,105 @@ def routed_predictions(
         local_to_global = model_info["local_id2global_fine_id"]
         routed[indices] = np.asarray([local_to_global[int(item)] for item in local_pred], dtype=int)
     return routed
+
+
+def collect_local_global_log_probs(
+    texts: list[str],
+    local_models: dict[int, dict[str, object]],
+    config: DeepTrainingConfig,
+    num_global_labels: int,
+) -> np.ndarray:
+    result = np.full((len(texts), num_global_labels), -30.0, dtype=np.float32)
+    if not texts:
+        return result
+    for model_info in local_models.values():
+        trainer = model_info["trainer"]
+        local_logits = trainer.collect_logits(build_predict_dataloader(texts, config=config))
+        local_log_probs = log_softmax(local_logits)
+        local_to_global = model_info["local_id2global_fine_id"]
+        for local_id, global_id in local_to_global.items():
+            result[:, int(global_id)] = local_log_probs[:, int(local_id)]
+    return result
+
+
+def fine_to_coarse_array(
+    num_fine_labels: int,
+    local_models: dict[int, dict[str, object]],
+) -> np.ndarray:
+    mapping = np.full(num_fine_labels, -1, dtype=int)
+    for coarse_id, model_info in local_models.items():
+        for global_id in model_info["local_id2global_fine_id"].values():
+            mapping[int(global_id)] = int(coarse_id)
+    return mapping
+
+
+def coarse_log_probs_for_fine_labels(coarse_logits: np.ndarray, fine_to_coarse: np.ndarray) -> np.ndarray:
+    coarse_log_probs = log_softmax(coarse_logits)
+    result = np.zeros((coarse_logits.shape[0], len(fine_to_coarse)), dtype=np.float32)
+    for fine_id, coarse_id in enumerate(fine_to_coarse.tolist()):
+        if coarse_id >= 0:
+            result[:, fine_id] = coarse_log_probs[:, coarse_id]
+    return result
+
+
+def tune_flat_local_coarse_fusion(
+    y_true: np.ndarray,
+    flat_logits: np.ndarray,
+    coarse_logits: np.ndarray,
+    local_log_probs: np.ndarray,
+    fine_to_coarse: np.ndarray,
+    *,
+    metric_name: str,
+    coarse_weights: list[float],
+    local_weights: list[float],
+) -> tuple[dict[str, object], np.ndarray, dict[str, float]]:
+    flat_log_probs = log_softmax(flat_logits)
+    coarse_fine_log_probs = coarse_log_probs_for_fine_labels(coarse_logits, fine_to_coarse)
+    best_pred = np.argmax(flat_log_probs, axis=1)
+    best_metrics = compute_classification_metrics(y_true, best_pred)
+    best_config: dict[str, object] = {
+        "use_hierarchical_routing": False,
+        "fusion_mode": "flat_baseline",
+        "coarse_weight": 0.0,
+        "local_weight": 0.0,
+    }
+
+    for coarse_weight in sorted(set(float(item) for item in coarse_weights)):
+        for local_weight in sorted(set(float(item) for item in local_weights)):
+            if coarse_weight == 0.0 and local_weight == 0.0:
+                continue
+            scores = flat_log_probs + coarse_weight * coarse_fine_log_probs + local_weight * local_log_probs
+            pred = np.argmax(scores, axis=1)
+            metrics = compute_classification_metrics(y_true, pred)
+            if is_better(metrics, best_metrics, metric_name):
+                best_pred = pred
+                best_metrics = metrics
+                best_config = {
+                    "use_hierarchical_routing": True,
+                    "fusion_mode": "flat_local_coarse",
+                    "coarse_weight": float(coarse_weight),
+                    "local_weight": float(local_weight),
+                }
+    return best_config, best_pred, best_metrics
+
+
+def apply_flat_local_coarse_fusion(
+    flat_logits: np.ndarray,
+    coarse_logits: np.ndarray,
+    local_log_probs: np.ndarray,
+    fine_to_coarse: np.ndarray,
+    config: dict[str, object],
+) -> tuple[np.ndarray, dict[str, int]]:
+    if not bool(config.get("use_hierarchical_routing", False)):
+        pred = np.argmax(flat_logits, axis=1)
+        return pred, {"num_routed": 0, "num_fallback": int(len(pred))}
+    scores = (
+        log_softmax(flat_logits)
+        + float(config.get("coarse_weight", 0.0)) * coarse_log_probs_for_fine_labels(coarse_logits, fine_to_coarse)
+        + float(config.get("local_weight", 0.0)) * local_log_probs
+    )
+    pred = np.argmax(scores, axis=1)
+    return pred, {"num_routed": int(len(pred)), "num_fallback": 0}
 
 
 def apply_gating(
@@ -521,8 +688,6 @@ def main() -> None:
         device,
         class_weights=fine_class_weights if args.loss in {"weighted_ce", "focal"} else None,
     )
-    import torch
-
     fine_ckpt_path = Path(args.fine_checkpoint).expanduser() if args.fine_checkpoint else None
     if fine_ckpt_path is not None and fine_ckpt_path.exists() and fine_ckpt_path.is_file():
         flat_trainer.model.load_state_dict(torch.load(fine_ckpt_path, map_location=device))
@@ -531,6 +696,7 @@ def main() -> None:
     else:
         flat_best_valid, flat_best_path = flat_trainer.fit(fine_train_loader, fine_valid_loader, flat_output_dir)
     flat_test_metrics = flat_trainer.evaluate(fine_test_loader)
+    flat_state_dict = torch.load(flat_best_path, map_location=device) if args.local_init_from_flat else None
 
     coarse_output_dir = args.output_dir / "coarse_model"
     coarse_trainer = DeepChargeTrainer(args.coarse_model_type, len(coarse_l2i), coarse_config, device)
@@ -569,6 +735,8 @@ def main() -> None:
             train_cache_key=build_tokenizer_cache_key(train_path, fine_config, extra=f"local-train|{coarse_label}|{len(train_subset)}"),
             valid_cache_key=build_tokenizer_cache_key(valid_path, fine_config, extra=f"local-valid|{coarse_label}|{len(valid_subset)}"),
             test_cache_key=build_tokenizer_cache_key(test_path, fine_config, extra=f"local-test|{coarse_label}|{len(test_subset)}"),
+            flat_state_dict=flat_state_dict,
+            local_id2global_fine_id=local_i2g if args.local_init_from_flat else None,
         )
         local_models[int(coarse_id)] = {
             "coarse_label": coarse_label,
@@ -608,32 +776,67 @@ def main() -> None:
         config=fine_config,
     )
 
-    routing_config, valid_hier_pred, valid_hier_metrics, valid_routing_stats = tune_routing(
-        y_true=y_valid_f,
-        flat_pred=valid_flat_pred,
-        routed_pred=valid_routed_pred,
-        coarse_logits=valid_coarse_logits,
-        metric_name=fine_config.selection_metric,
-        fallback_to_flat=args.fallback_to_flat,
-        preset_confidence_threshold=args.coarse_threshold,
-        preset_margin_threshold=args.coarse_margin_threshold,
-    )
-
-    test_probs = softmax(test_coarse_logits)
-    test_coarse_conf, test_coarse_margin = top1_and_margin(test_probs)
-    if not bool(routing_config.get("use_hierarchical_routing", False)):
-        test_hier_pred = np.array(test_flat_pred, copy=True)
-        test_routing_stats = {"num_routed": 0, "num_fallback": int(len(test_flat_pred))}
-    else:
-        test_hier_pred, test_routing_stats = apply_gating(
-            flat_pred=test_flat_pred,
-            routed_pred=test_routed_pred,
-            coarse_confidence=test_coarse_conf,
-            coarse_margin=test_coarse_margin,
-            confidence_threshold=float(routing_config.get("coarse_threshold") or 0.0),
-            margin_threshold=float(routing_config.get("coarse_margin_threshold") or 0.0),
-            fallback_to_flat=bool(routing_config.get("fallback_to_flat", False)),
+    if args.hier_fusion_mode == "flat_local_coarse":
+        fine_to_coarse = fine_to_coarse_array(len(fine_l2i), local_models)
+        valid_local_log_probs = collect_local_global_log_probs(
+            x_valid,
+            local_models,
+            fine_config,
+            len(fine_l2i),
         )
+        test_local_log_probs = collect_local_global_log_probs(
+            x_test,
+            local_models,
+            fine_config,
+            len(fine_l2i),
+        )
+        routing_config, valid_hier_pred, valid_hier_metrics = tune_flat_local_coarse_fusion(
+            y_true=y_valid_f,
+            flat_logits=valid_flat_logits,
+            coarse_logits=valid_coarse_logits,
+            local_log_probs=valid_local_log_probs,
+            fine_to_coarse=fine_to_coarse,
+            metric_name=fine_config.selection_metric,
+            coarse_weights=args.coarse_fusion_weights,
+            local_weights=args.local_fusion_weights,
+        )
+        test_hier_pred, test_routing_stats = apply_flat_local_coarse_fusion(
+            test_flat_logits,
+            test_coarse_logits,
+            test_local_log_probs,
+            fine_to_coarse,
+            routing_config,
+        )
+        valid_routing_stats = {
+            "num_routed": int(len(valid_hier_pred)) if bool(routing_config.get("use_hierarchical_routing", False)) else 0,
+            "num_fallback": int(0 if bool(routing_config.get("use_hierarchical_routing", False)) else len(valid_hier_pred)),
+        }
+    else:
+        routing_config, valid_hier_pred, valid_hier_metrics, valid_routing_stats = tune_routing(
+            y_true=y_valid_f,
+            flat_pred=valid_flat_pred,
+            routed_pred=valid_routed_pred,
+            coarse_logits=valid_coarse_logits,
+            metric_name=fine_config.selection_metric,
+            fallback_to_flat=args.fallback_to_flat,
+            preset_confidence_threshold=args.coarse_threshold,
+            preset_margin_threshold=args.coarse_margin_threshold,
+        )
+        test_probs = softmax(test_coarse_logits)
+        test_coarse_conf, test_coarse_margin = top1_and_margin(test_probs)
+        if not bool(routing_config.get("use_hierarchical_routing", False)):
+            test_hier_pred = np.array(test_flat_pred, copy=True)
+            test_routing_stats = {"num_routed": 0, "num_fallback": int(len(test_flat_pred))}
+        else:
+            test_hier_pred, test_routing_stats = apply_gating(
+                flat_pred=test_flat_pred,
+                routed_pred=test_routed_pred,
+                coarse_confidence=test_coarse_conf,
+                coarse_margin=test_coarse_margin,
+                confidence_threshold=float(routing_config.get("coarse_threshold") or 0.0),
+                margin_threshold=float(routing_config.get("coarse_margin_threshold") or 0.0),
+                fallback_to_flat=bool(routing_config.get("fallback_to_flat", False)),
+            )
 
     valid_flat_metrics = compute_classification_metrics(y_valid_f, valid_flat_pred)
     test_flat_metrics = compute_classification_metrics(y_test_f, test_flat_pred)
@@ -680,6 +883,10 @@ def main() -> None:
             "max_train_samples": args.max_train_samples,
             "max_valid_samples": args.max_valid_samples,
             "max_test_samples": args.max_test_samples,
+            "local_init_from_flat": args.local_init_from_flat,
+            "hier_fusion_mode": args.hier_fusion_mode,
+            "coarse_fusion_weights": args.coarse_fusion_weights,
+            "local_fusion_weights": args.local_fusion_weights,
             "optimize_profile": args.optimize_profile,
             "loss": args.loss,
             "label_smoothing": args.label_smoothing,

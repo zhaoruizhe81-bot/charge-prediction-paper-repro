@@ -180,6 +180,41 @@ def build_contrast_table(table: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(contrast_rows).sort_values(by=["task", "delta_accuracy", "delta_f1_score"], ascending=[True, False, False])
 
 
+def build_best_contrast_table(table: pd.DataFrame) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    for task, group in table.groupby("task", dropna=False):
+        flat_rows = group[group["variant"] == "flat"]
+        hier_rows = group[group["variant"] == "hier"]
+        if flat_rows.empty or hier_rows.empty:
+            continue
+        flat = flat_rows.sort_values(by=["f1_score", "accuracy"], ascending=False).iloc[0]
+        hier = hier_rows.sort_values(by=["f1_score", "accuracy"], ascending=False).iloc[0]
+        rows.append(
+            {
+                "task": task,
+                "base_model": flat["model"],
+                "hier_model": hier["model"],
+                "base_source": flat["source"],
+                "hier_source": hier["source"],
+                "base_accuracy": float(flat["accuracy"]),
+                "hier_accuracy": float(hier["accuracy"]),
+                "delta_accuracy": float(hier["accuracy"] - flat["accuracy"]),
+                "base_recall_macro": float(flat["recall_macro"]),
+                "hier_recall_macro": float(hier["recall_macro"]),
+                "delta_recall_macro": float(hier["recall_macro"] - flat["recall_macro"]),
+                "base_recall_micro": float(flat["recall_micro"]),
+                "hier_recall_micro": float(hier["recall_micro"]),
+                "delta_recall_micro": float(hier["recall_micro"] - flat["recall_micro"]),
+                "base_f1_score": float(flat["f1_score"]),
+                "hier_f1_score": float(hier["f1_score"]),
+                "delta_f1_score": float(hier["f1_score"] - flat["f1_score"]),
+            }
+        )
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values(by=["delta_accuracy", "delta_f1_score"], ascending=False)
+
+
 def main() -> None:
     args = parse_args()
 
@@ -201,6 +236,12 @@ def main() -> None:
         contrast_path = args.save_path.with_name(f"{args.save_path.stem}_contrast.csv")
         contrast.to_csv(contrast_path, index=False, encoding="utf-8-sig")
         (contrast_path.with_suffix(".md")).write_text(dataframe_to_markdown(contrast), encoding="utf-8")
+
+    best_contrast = build_best_contrast_table(table)
+    if not best_contrast.empty:
+        best_contrast_path = args.save_path.with_name(f"{args.save_path.stem}_best_contrast.csv")
+        best_contrast.to_csv(best_contrast_path, index=False, encoding="utf-8-sig")
+        (best_contrast_path.with_suffix(".md")).write_text(dataframe_to_markdown(best_contrast), encoding="utf-8")
 
     if intermediate_rows:
         intermediate = pd.DataFrame(intermediate_rows).sort_values(by=["task", "model", "split", "stage"])

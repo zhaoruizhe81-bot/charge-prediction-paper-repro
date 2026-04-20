@@ -28,9 +28,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--law-deep-dir", type=Path, default=Path("outputs_paper/law_deep"))
     parser.add_argument("--output-dir", type=Path, default=Path("outputs_paper/law_hierarchical"))
     parser.add_argument("--models", nargs="+", default=["fc", "rcnn"])
-    parser.add_argument("--base-model", type=str, default="fc")
-    parser.add_argument("--thresholds", type=float, nargs="*", default=[0.2, 0.3, 0.4, 0.45, 0.5, 0.6])
-    parser.add_argument("--weights", nargs="*", default=["0.7,0.3", "0.5,0.5"])
+    parser.add_argument("--base-model", type=str, default="auto")
+    parser.add_argument("--thresholds", type=float, nargs="*", default=[0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7])
+    parser.add_argument("--weights", nargs="*", default=[])
     parser.add_argument(
         "--confusing-rule",
         type=str,
@@ -42,6 +42,12 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="f1_score",
         choices=["accuracy", "recall_macro", "recall_micro", "f1_macro", "f1_micro", "f1_score"],
+    )
+    parser.add_argument(
+        "--selection-objective",
+        type=str,
+        default="accuracy_f1_recall",
+        choices=["metric", "accuracy_f1_recall"],
     )
     return parser.parse_args()
 
@@ -56,6 +62,10 @@ def load_model_output(model_dir: Path) -> dict[str, np.ndarray]:
 
 def parse_weight_candidates(raw_weights: list[str], num_models: int) -> list[np.ndarray]:
     candidates: list[np.ndarray] = []
+    if not raw_weights and num_models == 1:
+        raw_weights = ["1.0"]
+    elif not raw_weights and num_models == 2:
+        raw_weights = [f"{w:.1f},{1.0 - w:.1f}" for w in np.linspace(0.0, 1.0, 11)]
     for item in raw_weights:
         values = [float(value.strip()) for value in item.split(",") if value.strip()]
         if len(values) != num_models:
@@ -67,6 +77,39 @@ def parse_weight_candidates(raw_weights: list[str], num_models: int) -> list[np.
     if not candidates:
         candidates.append(np.ones(num_models, dtype=np.float64) / max(num_models, 1))
     return candidates
+
+
+def objective_score(metrics: dict[str, float], base_metrics: dict[str, float], args: argparse.Namespace) -> tuple[int, float, float, float]:
+    if args.selection_objective == "metric":
+        return (
+            1,
+            float(metrics.get(args.selection_metric, 0.0)),
+            float(metrics.get("accuracy", 0.0)),
+            float(metrics.get("recall_macro", 0.0)),
+        )
+    keeps_accuracy = int(float(metrics.get("accuracy", 0.0)) >= float(base_metrics.get("accuracy", 0.0)) - 1e-12)
+    return (
+        keeps_accuracy,
+        float(metrics.get("f1_score", 0.0)),
+        float(metrics.get("accuracy", 0.0)),
+        float(metrics.get("recall_macro", 0.0)),
+    )
+
+
+def choose_base_model(law_metrics: dict[str, object], requested: str) -> str:
+    if requested != "auto":
+        return requested
+    best_model = ""
+    best_score = (-1.0, -1.0)
+    for model_name, payload in law_metrics.items():
+        metrics = payload.get("tuned_valid") or payload.get("best_valid") or payload.get("test", {})
+        score = (float(metrics.get("f1_score", 0.0)), float(metrics.get("accuracy", 0.0)))
+        if score > best_score:
+            best_score = score
+            best_model = str(model_name)
+    if not best_model:
+        raise ValueError("Cannot infer --base-model auto because law_deep metrics are empty.")
+    return best_model
 
 
 def find_confusing_label_ids(y_valid: np.ndarray, valid_pred: np.ndarray, rule: str) -> list[int]:
@@ -121,24 +164,28 @@ def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
+    law_metrics = json.loads((args.law_deep_dir / "metrics.json").read_text(encoding="utf-8"))
+    base_model = choose_base_model(law_metrics, args.base_model)
     outputs = {model: load_model_output(args.law_deep_dir / model) for model in args.models}
-    if args.base_model not in outputs:
-        raise ValueError(f"base model {args.base_model!r} not found in --models")
-    base = outputs[args.base_model]
+    if base_model not in outputs:
+        raise ValueError(f"base model {base_model!r} not found in --models")
+    base = outputs[base_model]
     y_valid = base["y_valid"]
     y_test = base["y_test"]
     base_valid_scores = base["valid_scores"]
     base_test_scores = base["test_scores"]
 
-    base_metrics_path = args.law_deep_dir / args.base_model / "model_bundle.json"
+    base_metrics_path = args.law_deep_dir / base_model / "model_bundle.json"
     id2label: dict[int, str] = {}
     if base_metrics_path.exists():
         bundle = json.loads(base_metrics_path.read_text(encoding="utf-8"))
         id2label = {int(k): str(v) for k, v in bundle.get("id2label", {}).items()}
 
-    base_threshold = float(json.loads((args.law_deep_dir / "metrics.json").read_text(encoding="utf-8"))[args.base_model]["threshold"])
+    base_threshold = float(law_metrics[base_model]["threshold"])
     base_valid_pred = multilabel_predictions_from_scores(base_valid_scores, base_threshold)
     base_test_pred = multilabel_predictions_from_scores(base_test_scores, base_threshold)
+    base_valid_metrics = compute_multilabel_metrics(y_valid, base_valid_pred)
+    base_test_metrics = compute_multilabel_metrics(y_test, base_test_pred)
     confusing_ids = find_confusing_label_ids(y_valid, base_valid_pred, args.confusing_rule)
 
     valid_scores_list = [outputs[model]["valid_scores"] for model in args.models]
@@ -157,13 +204,16 @@ def main() -> None:
                 confusing_threshold=float(threshold),
             )
             metrics = compute_multilabel_metrics(y_valid, valid_pred)
-            if best is None or float(metrics[args.selection_metric]) > float(best["valid"][args.selection_metric]):
+            score = objective_score(metrics, base_valid_metrics, args)
+            best_score = best.get("score") if best is not None else None
+            if best is None or score > best_score:
                 best = {
                     "weights": weights,
                     "confusing_threshold": float(threshold),
                     "valid": metrics,
                     "valid_pred": valid_pred,
                     "fused_valid_scores": fused_valid_scores,
+                    "score": score,
                 }
 
     if best is None:
@@ -178,8 +228,6 @@ def main() -> None:
         confusing_threshold=float(best["confusing_threshold"]),
     )
     test_metrics = compute_multilabel_metrics(y_test, test_pred)
-    base_valid_metrics = compute_multilabel_metrics(y_valid, base_valid_pred)
-    base_test_metrics = compute_multilabel_metrics(y_test, base_test_pred)
 
     intermediate_rows = [
         {"split": "valid", "stage": "flat_law", **base_valid_metrics},
@@ -210,7 +258,7 @@ def main() -> None:
         "task_mode": "law_article_multilabel",
         "config": {
             "models": args.models,
-            "base_model": args.base_model,
+            "base_model": base_model,
             "base_threshold": base_threshold,
             "confusing_rule": args.confusing_rule,
             "confusing_label_count": len(confusing_ids),
@@ -218,6 +266,7 @@ def main() -> None:
             "weights": [float(item) for item in np.asarray(best["weights"], dtype=float).tolist()],
             "confusing_threshold": float(best["confusing_threshold"]),
             "selection_metric": args.selection_metric,
+            "selection_objective": args.selection_objective,
         },
         "valid": {
             "flat_law": base_valid_metrics,
